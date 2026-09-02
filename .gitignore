@@ -1,0 +1,9 @@
+/target/
+*.log
+.DS_Store
+
+# Local agent/session artifacts and temporary dependency probes.
+/session-*.md
+/codex-session-*.md
+/.tmp-pkgconfig/
+/.tmp-pkgconfig-bin/

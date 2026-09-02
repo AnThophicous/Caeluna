@@ -1,0 +1,38 @@
+[package]
+name = "rouch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "A lightweight Liquid Glass Tahoe-inspired Wayland compositor."
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["native-session"]
+native-session = [
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_vulkan",
+    "smithay/renderer_pixman",
+    "smithay/xwayland",
+]
+
+[dependencies]
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+# Smithay interfaces directly with the Linux Wayland and graphics stack.  Keeping
+# this dependency Linux-only lets contributors run design tests from Windows too.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.189"
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_session_libseat",
+    "backend_udev",
+    "backend_winit",
+    "desktop",
+    "renderer_gl",
+    "wayland_frontend",
+] }
+image = { version = "0.25", default-features = false, features = ["webp"] }
+fontdue = "0.9"
+sha2 = "0.10"

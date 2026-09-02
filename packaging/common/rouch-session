@@ -1,0 +1,21 @@
+#!/bin/sh
+# Compatibility launcher for the installed Wayland session.
+#
+# The session selector asks Rouch to acquire the native seat. If native DRM/KMS
+# is not ready yet, the binary follows its explicit nested fallback policy.
+set -eu
+
+binary=${ROUCH_BIN:-/usr/bin/rouch}
+if [ "${1-}" = "--session" ]; then
+    shift
+fi
+if [ ! -x "$binary" ]; then
+    printf '%s\n' "Rouch session: executable not found: $binary" >&2
+    exit 127
+fi
+
+export ROUCH_LAUNCH_MODE=session
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Rouch}"
+export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-Rouch}"
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+exec "$binary" --session "$@"

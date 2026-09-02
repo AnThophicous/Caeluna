@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Rouch
+GenericName=Liquid Glass Desktop
+Comment=Launch the Rouch Liquid Glass desktop in nested mode
+Exec=/usr/bin/rouch-nested --nested
+TryExec=/usr/bin/rouch-nested
+Icon=application-x-executable
+Terminal=false
+Categories=System;Utility;
+Keywords=Rouch;Wayland;Liquid;Glass;Desktop;
+StartupNotify=true
+X-Rouch-Launch-Mode=nested
+X-Rouch-Interface-Stage=1

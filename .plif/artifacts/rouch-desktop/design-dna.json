@@ -1,0 +1,47 @@
+{
+  "direction": "Tahoe-inspired Liquid Glass desktop shell with an editorial application surface, compact system controls, and a calm performance mode",
+  "tone": "calm, precise, native",
+  "density": "balanced",
+  "experience_archetype": "EXPLORE with OPERATE support",
+  "visual_thesis": "Caelune should make Linux feel like a Tahoe desktop: keep the wallpaper and windows calm, let a small set of translucent Liquid Glass surfaces carry orientation and action, and give the selected app a generous editorial stage without sacrificing low-end readability or speed.",
+  "composition_law": "Use a persistent Tahoe-like top bar and dock as orientation anchors; the app gallery is a two-column stage with one featured app and a compact grid of supporting results; the terminal is a focused tabbed work surface; settings and notifications enter as anchored sheets rather than replacing context; Game Mode is an explicit, evidence-backed control sheet that makes the active workload and reversible changes legible.",
+  "geometry_law": "Window chrome uses a 12px structural radius, shell sheets use 18px, and interactive controls use 10px; geometry is rectangular-first with circles reserved for avatars, status dots, and traffic-light actions.",
+  "spacing_rhythm": "Base 8px rhythm with 12px inner control gaps, 16px panel padding, 24px region separation, and 32px stage breathing room.",
+  "container_law": "Opaque content panels remain readable over the wallpaper; translucent material is limited to top bar, dock, notifications, control centre, gallery chrome, and terminal chrome with an opaque fallback.",
+  "radius_law": "Three-level radius hierarchy: 10px controls, 12px windows/content frames, 18px transient shell sheets; no universal pills and no nested card stacks unless the inner item is a distinct interactive target.",
+  "border_law": "Use one low-alpha light edge for floating material and a stronger 1px focus/selection edge; separators appear only where navigation grouping needs them.",
+  "elevation_law": "Depth comes from separation from the wallpaper, one restrained shadow layer, and backdrop tint; avoid glow as a hierarchy substitute.",
+  "material_light_law": "The wallpaper is the ambient field; Liquid Glass absorbs it into a cool tinted surface with one soft highlight edge, and bounded quarter/half-resolution backdrop sampling is allowed only on the top bar, dock, control centre, notifications, gallery chrome, and terminal chrome. Reduced transparency removes sampling and increases tint opacity; low-end mode may disable blur entirely.",
+  "type_roles": [
+    {"role":"display","family":"system UI fallback chain","size_behavior":"30px wide to 22px narrow","weight":"650","measure":"18ch"},
+    {"role":"page-title","family":"system UI fallback chain","size_behavior":"22px","weight":"650","measure":"28ch"},
+    {"role":"body","family":"system UI fallback chain","size_behavior":"15px","weight":"400","measure":"62ch"},
+    {"role":"control","family":"system UI fallback chain","size_behavior":"13px","weight":"600","measure":"24ch"},
+    {"role":"metadata","family":"system UI fallback chain","size_behavior":"11px","weight":"500","measure":"32ch"}
+  ],
+  "chroma_budget": "Wallpaper carries the strongest colour; shell surfaces stay ice-white/blue-black with cyan reserved for selected, active, and progress states. Red/amber/green are semantic traffic-light actions only.",
+  "icon_family": "Project-normalized monochrome glyphs with one optical stroke; no emoji icons.",
+  "asset_world": "Product evidence first: installed app icons, desktop-entry names, Flatpak metadata, and the supplied ocean wallpaper. No stock photography, fake reviews, or fabricated app metrics.",
+  "media_role": "Wallpaper is atmosphere and orientation, never required content; icons and screenshots are informational product assets with dimensions reserved before decode.",
+  "motion_character": "Short, interruptible spatial transitions that explain where a sheet or window came from; pointer hover is cheap and discrete, primary-button feedback is explicit, app launch uses one bounded bounce, notification entry uses a lateral stack settle, and reduced motion becomes opacity plus immediate state replacement.",
+  "signature_move": "The selected Flatpak app keeps a continuous identity thread from its gallery tile into its detail/install state: icon, name, origin, and action remain aligned while the stage changes.",
+  "counter_default": "Refuse the generic dashboard of equal cards and purple gradients; Caelune uses a single selected-app focal stage, real catalog metadata, evidence-led workload detection, and anchored system surfaces so the product remains identifiable without effects.",
+  "anti_goals": [
+    "Do not blur application content or terminal output automatically.",
+    "Do not fabricate catalog ratings, download counts, testimonials, or install success.",
+    "Do not hide notifications behind hover-only affordances.",
+    "Do not make Vulkan, blur, or any GPU effect a prerequisite for usable windows.",
+    "Do not identify a game from a hardcoded title list or suspend/kill unrelated applications; Game Mode must use observable evidence and a reversible policy.",
+    "Do not make pointer motion trigger full-shell redraws when hover state did not change.",
+    "Official support targets Mint, Ubuntu, and Arch; other distributions must use an explicit best-effort path.",
+    "Do not ship an installer that silently mutates system files or swaps."
+  ],
+  "visual_tension_notes": "The shell balances a calm ocean field with operational density. The gallery can breathe, while terminal output stays dense and calm; keyboard focus, pointer hover, search, install status, notifications, tab switching, window switching, and Game Mode evidence must settle immediately and remain legible in opaque fallback mode.",
+  "evidence_refs": [
+    "Observed: src/design.rs limits glass to named shell surfaces and has a reduced-transparency recipe.",
+    "Observed: src/launcher.rs and desktop_entry.rs already provide application search and freedesktop metadata.",
+    "Observed: src/linux/nested.rs is the current Winit/OpenGL nested backend and gates shell redraws around meaningful pointer/dock changes.",
+    "Observed: src/linux/input.rs owns the shared shortcut table, finite pointer coordinates, and primary input normalization; src/finder.rs shares disjoint toolbar hit slots with its renderer.",
+    "Inferred: Flathub availability and Vulkan support vary by host; all external and GPU states need explicit fallbacks."
+  ]
+}

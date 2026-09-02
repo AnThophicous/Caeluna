@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Rouch
+Comment=Rouch Liquid Glass Wayland session
+Exec=/usr/bin/rouch-session --session
+TryExec=/usr/bin/rouch-session
+Type=Application
+DesktopNames=Rouch
+X-Rouch-Launch-Mode=session

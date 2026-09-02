@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "product_frame": {
+    "who": "Linux desktop users running Caelune as a Wayland shell, including people installing it for the first time, repeatedly launching apps, and playing games on both weak and powerful hardware.",
+    "job": "Find, install, launch, switch, and manage desktop applications while keeping system feedback and recovery visible.",
+    "consequence": "A failed install, lost window, hidden notification, or GPU failure can strand the user or cause data loss, so the shell must explain state and preserve a fallback path.",
+    "primary_action": "Select one application and either launch it or start an explicit Flatpak install.",
+    "density": "balanced",
+    "frequency": "Catalog discovery is occasional; app launching and window switching are repeated throughout a session.",
+    "risk_level": "medium-high for install, swap, and window lifecycle actions; low for browsing",
+    "device_profile": "Keyboard/pointer desktop first, with narrow nested-host layouts and touch-sized hit areas where space permits; official Linux targets are Mint, Ubuntu, and Arch.",
+    "secondary_actions": ["Search/filter catalog", "Review install progress or error", "Open notifications", "Change notification, graphics, and Game Mode preferences", "Open a real terminal tab", "Switch or arrange windows", "Inspect workload evidence and restore the previous profile"],
+    "info_priority": {"must_see_before_action":["app name","origin","install/launch state","focused window state"],"background":["icon","category","version when available"],"on_demand":["remote metadata","diagnostics","swap and backend details"]},
+    "surface_type": "native app-shell / catalog / settings / compositor workspace",
+    "experience_archetype": {"dominant":"EXPLORE","supporting":"OPERATE","evidence":"A catalog requires orientation and curiosity, while a desktop shell requires stable placement, low-latency keyboard continuity, and recoverable state.","impact_if_false":"If OPERATE dominates every surface, the gallery becomes a dense utility list; if EXPLORE dominates settings and windows, repeated actions become slow and disorienting."},
+    "frequency_density": "Gallery discovery is occasional; launching and switching windows is frequent and must stay compact. The shell should support 3/30/300 installed entries through filtering and bounded rendering rather than unbounded tiles.",
+    "device_input": "Wide desktop pointer/keyboard first, with narrow host-window and touch-like pointer coordinates treated as supported adaptations; Super shortcuts, Tab cycling, Escape, Enter, and focus-visible states are required.",
+    "content_truth": "Installed applications come from freedesktop desktop entries and Flatpak metadata; system notices come from real command results; absent tools and offline remotes are shown as unavailable rather than simulated.",
+    "success_state": "The chosen app is mapped/running, an install has a confirmed result, a notification is either read or intentionally disabled, or a window is visibly focused/arranged."
+  },
+  "user_jobs": [
+    {"id":"catalog-discover","entry":"Launcher, dock, or App Gallery","completion":"A real installed or available app is selected with its source visible."},
+    {"id":"catalog-install","entry":"App detail","completion":"Flatpak install returns success, cancellation, or actionable error."},
+    {"id":"notification-control","entry":"Top bar notification affordance or Settings","completion":"Notifications are enabled, disabled, grouped, or put into Do Not Disturb with visible status."},
+    {"id":"window-switch","entry":"Desktop with two or more mapped windows","completion":"Alt-Tab or overview focuses the intended window and preserves MRU order."},
+    {"id":"first-run-setup","entry":"Installer or first launch","completion":"Initial backend, startup, notification, and optional swap choices are persisted with recovery."}
+  ],
+  "constraints": {
+    "platform":"Linux Wayland compositor in Rust 2024; official support targets Mint, Ubuntu, and Arch. Winit nested backend exists today while native session work is added.",
+    "graphics":"Vulkan preferred when available; OpenGL is the required fallback and software/opaque rendering is the last resort; Liquid Glass effects remain bounded and optional on low-end hardware.",
+    "external":"Flatpak/Flathub, nmcli, pactl, system files, and package managers can be missing or offline.",
+    "safety":"Swapfile and installer actions must be explicit, idempotent, permission-aware, and dry-runnable.",
+    "performance":"Avoid full-output blur, unbounded animation, per-frame allocations, and background work while hidden; use low-end budgets and real measurements before speed claims."
+  },
+  "existing_system": {
+    "stack_ref":"Rust compatibility crate rouch 0.1.0 (public product name Caelune); Smithay 0.7; Winit nested backend with renderer_gl; pure models for launcher, Finder, settings, widgets, dock, chrome, windowing, and workload detection.",
+    "existing_surfaces":["top bar","dock","launcher","Finder","Settings","Game Mode settings pane","control centre","widgets","tabbed terminal","welcome/update/tutorial overlay","Wayland/XDG shell"],
+    "existing_patterns":["pure geometry/state modules with renderer sampling","unit tests in source modules","real system reads/writes in linux backends","GlassRecipe with reduced-transparency and battery policies","shared shell shortcut resolution and finite pointer hit-testing with primary-button ownership"],
+    "missing_or_risky":["native DRM/libinput and XWayland remain outside current nested milestone","PTY and VT runtime on Linux needs hardware/session verification","Flatpak catalog/install lifecycle","notification queue and settings","Vulkan selection","full MRU/workspace/window integration","installer system mutation and setup persistence","game detector and resource policy need Linux process/window/cgroup verification; false positives must remain reversible"]
+  },
+  "invariants": [
+    "No external command result is presented as success until its exit status and output say so.",
+    "Every GPU path has a working OpenGL or opaque fallback and a diagnosable failure state.",
+    "A notification setting change is reflected in both persisted preference and live routing before the control settles.",
+    "The active window is reachable, visible, and represented in MRU order after focus, minimize, maximize, fullscreen, close, and workspace changes.",
+    "Install, swap, and startup configuration operations are idempotent and never silently overwrite user data.",
+    "Keyboard focus order and visible focus survive gallery, settings, notification, window-switcher, and error states.",
+    "Game Mode only changes bounded, explicitly named shell policies after confidence/evidence checks; it snapshots those policies and restores them when the game session ends."
+  ],
+  "information_architecture": {
+    "nav_model":"Persistent shell anchors: top bar for system status/notifications, dock for pinned/running apps, window space for work, and anchored sheets for gallery/settings/notifications.",
+    "persistent_context":["current workspace","active app/window","notification status","graphics backend status when degraded"],
+    "sequence":"entry -> orient with search/status -> inspect app/window -> act install/launch/focus -> receive settlement -> continue or recover",
+    "info_obligations": {
+      "must_see_before_action":["app name","origin","install/launch state","focused window state"],
+      "must_remain_visible":["current workspace","active app/window","notification status","recoverable error or progress"],
+      "reveal_on_demand":["version","remote metadata","command diagnostics","cache age","swap plan","GPU details"]
+    },
+    "disclosure":"Show action state and source first; reveal version, command diagnostics, cache age, swap plan, and GPU details on demand.",
+    "responsive_transforms":"At intermediate/narrow widths, app detail moves below results, sidebars become a selectable sheet, notification stack becomes a full-width tray, and window switcher keeps one focused row/preview at a time.",
+    "failure_recovery":["retry remote query","use cached catalog","launch installed app without Flatpak remote","switch to OpenGL","keep opaque shell","undo or skip swap plan","resume installer from recorded stage"]
+  },
+  "design_dna":".plif/artifacts/rouch-desktop/design-dna.json",
+  "component_graph": [
+    {"component":"AppGallery","role":"catalog discovery and install action","states":["loading","populated","empty","offline","installing","installed","error"]},
+    {"component":"NotificationCenter","role":"grouped system/app feedback","states":["closed","open","unread","empty","disabled","do-not-disturb"]},
+    {"component":"SettingsNotificationPane","role":"enable/disable and delivery preferences","states":["read","dirty","saved","error"]},
+    {"component":"WindowSwitcher","role":"MRU/Alt-Tab and overview","states":["idle","cycling","selected","empty"]},
+    {"component":"GraphicsPolicy","role":"Vulkan preference and OpenGL fallback","states":["probing","vulkan","opengl","opaque-degraded"]},
+    {"component":"SetupFlow","role":"first-run install/startup choices","states":["welcome","checking","ready","applying","complete","recoverable-error"]},
+    {"component":"SwapManager","role":"safe optional swap plan","states":["detected","recommended","dry-run","applying","complete","blocked"]},
+    {"component":"TabbedTerminal","role":"real PTY command surface","states":["closed","starting","running","exited","error"]},
+    {"component":"FirstStepsTutorial","role":"guided first-run orientation","states":["hidden","step-one","step-progress","complete","skipped","resumable"]},
+    {"component":"GameModeSettings","role":"explicit Auto/On/Off policy with evidence, cache, and restore status","states":["off","armed","detecting","active","restoring","error"]},
+    {"component":"GameActivityDetector","role":"bounded process/window/environment evidence scorer without title lists","states":["idle","sampling","probable","confirmed","ordinary-app","unknown"]}
+  ],
+  "interaction_graph": [
+    {"states":["closed","open"],"event":"press gallery shortcut","guard":"shell is not locked","next_state":"open","side_effect":"focus search","settlement":"search receives focus","render_consequence":"anchored gallery sheet appears"},
+    {"states":["loading","populated","empty","offline","populated or offline/empty"],"event":"flatpak query completes","guard":"request generation is current","next_state":"populated","side_effect":"cache valid results and error metadata; settle to empty/offline when the result says so","settlement":"catalog status is explicit","render_consequence":"results or recovery action render"},
+    {"states":["ready","installing","installed","error"],"event":"press install","guard":"entry has a valid Flatpak ref and backend is available","next_state":"installing","side_effect":"spawn bounded flatpak process","settlement":"success/error/cancel is announced","render_consequence":"button and progress state update"},
+    {"states":["unread","open","disabled","do-not-disturb","saved preference state"],"event":"change notification preference","guard":"setting row is enabled","next_state":"saved preference state","side_effect":"persist and update router","settlement":"toast or inline confirmation","render_consequence":"new events follow the setting immediately"},
+    {"states":["idle","cycling","selected"],"event":"press and hold Alt+Tab","guard":"at least two visible switchable windows","next_state":"cycling","side_effect":"move highlight through MRU list","settlement":"release focuses highlighted window","render_consequence":"switcher overlay follows keyboard"},
+    {"states":["probing","vulkan","opengl","opaque-degraded","vulkan or opengl or opaque-degraded"],"event":"renderer init or context loss","guard":"backend reports capability","next_state":"vulkan","side_effect":"record diagnostic and release failed resources; settle to OpenGL or opaque-degraded when Vulkan is unavailable","settlement":"one usable renderer remains","render_consequence":"effect level and status badge change"},
+    {"states":["idle","hovering","pressed","focused"],"event":"move or press the pointer on shell chrome","guard":"finite coordinates and a valid hit target","next_state":"hovering","side_effect":"only the primary button may activate shell actions; other buttons remain client input","settlement":"target feedback and keyboard focus agree","render_consequence":"dock hover redraws only on meaningful motion and disjoint toolbar targets settle predictably"}
+    ,{"states":["closed","starting","running","exited","error"],"event":"open terminal or create tab","guard":"shell is available or an actionable start error is recorded","next_state":"starting","side_effect":"spawn a PTY session with bounded UTF-8/VT buffers","settlement":"prompt/output is visible or the error names recovery","render_consequence":"active tab and process state settle without stealing unrelated focus"}
+    ,{"states":["hidden","step-one","step-progress","complete","skipped","resumable"],"event":"advance or resume first-steps tutorial","guard":"welcome surface is open and keyboard focus is available","next_state":"step-progress","side_effect":"persist current step or explicit skip","settlement":"the next action is clear and reversible","render_consequence":"one anchored Liquid Glass card changes content without a layout jump"}
+    ,{"states":["off","armed","detecting","probable","confirmed","ordinary-app","unknown"],"event":"sample foreground workload","guard":"Game Mode is Auto or the user requested an explicit review","next_state":"probable","side_effect":"score bounded process/window/launcher evidence and retain reasons; settle to confirmed, ordinary-app, or unknown when evidence requires","settlement":"confidence and evidence are visible before policy changes","render_consequence":"only the compact status/control sheet changes"}
+    ,{"states":["armed","detecting","active","restoring","error"],"event":"enter or leave a confirmed game session","guard":"policy is enabled and a reversible snapshot exists","next_state":"active","side_effect":"apply bounded shell profile, keep input/audio/security alive, then restore the snapshot; settle to restoring or error when leaving/failing","settlement":"previous profile is restored or the error names the unapplied action","render_consequence":"glass/effects and status badge change without a full-screen transition"}
+  ],
+  "motion": {
+    "purpose":"Explain spatial continuity and acknowledgement without delaying repeated desktop work.",
+    "tempo":{"microfeedback":"100-180ms","sheet":"180-260ms","window":"220-360ms","launch_bounce":"<=700ms"},
+    "spatial_model":"Sheets descend from their top-bar/dock anchor; window switcher is centered over the current workspace; minimized windows travel toward their dock group.",
+    "hierarchy":{"signature_sequence":"App identity remains continuous while gallery selection becomes an install/launch state.","recurring_motifs":["anchored sheet settle","MRU highlight move","notification stack insertion"],"microfeedback":["toggle acknowledgement","install progress","focus ring","retry/error settlement"]},
+    "sequences":[
+      {"id":"gallery-selection","trigger":"select a catalog tile","purpose":"retain app identity while changing detail state","beats":["tile highlights","detail stage adopts icon/name/source","action state settles"],"easing":"ease-out then linear status updates","interruption":"new selection cancels prior transition without stale install state","settlement":"one selected entry owns the action","reduced_motion":"instant selection plus outline and icon/name replacement","verification_keyframes":["before selection","detail adopted","installing/error/success"]},
+      {"id":"notification-entry","trigger":"new allowed notification","purpose":"show cause without stealing focus","beats":["stack reserves space","group enters from top-right","read/unread state settles"],"easing":"short ease-out","interruption":"new group merges by source; DND suppresses visual entry","settlement":"notification remains actionable in center","reduced_motion":"opacity/discrete insertion","verification_keyframes":["empty","one group","many groups","DND"]}
+    ],
+    "engine_boundaries":["CSS-like geometry transitions are renderer-local; no second animation engine is required for pure state models."],
+    "reduced_motion":"Remove translation, bounce, backdrop drift, and continuous effects; preserve selection, focus, progress, and notification meaning through color, outline, copy, and immediate layout."
+  },
+  "responsive_contract": {
+    "viewport_matrix_hint":[390,768,1024,1440],
+    "risky_states":["long app names","offline catalog","install error","many notifications","Alt-Tab with minimized windows","reduced transparency"],
+    "states_extra":["keyboard focus","touch-like pointer","high text scale"],
+    "long_content_relevant":true,
+    "breakpoint_policy":"Transform when the current composition or focus order fails; do not create device-name breakpoints.",
+    "regions":[
+      {"region":"top bar","wide":"status, active app, notification affordance, controls","mid_1024":"status and active app remain; secondary labels compress","mid_768":"active app label may collapse to icon while notification control remains","narrow_390":"single row with status icons and a dedicated notification hit target","verify_at":[390,768,1024,1440],"ownership":"top-bar layout"},
+      {"region":"app gallery","wide":"featured detail beside filtered results","mid_1024":"detail narrows before results; search remains visible","mid_768":"detail stacks below results and selected identity remains sticky","narrow_390":"single-column result list with detail sheet or below-list disclosure","verify_at":[390,768,1024,1440],"ownership":"gallery structure"},
+      {"region":"notifications","wide":"anchored grouped stack with center sheet","mid_1024":"stack caps width and groups by source","mid_768":"center becomes full-width tray with one group expanded","narrow_390":"bottom-safe-area tray with explicit close/read actions","verify_at":[390,768,1024,1440],"ownership":"notification tray"},
+      {"region":"window switcher","wide":"centered MRU preview row","mid_1024":"preview row compresses while labels remain","mid_768":"one selected preview plus adjacent labels","narrow_390":"full-width list with selected item and keyboard/escape hint","verify_at":[390,768,1024,1440],"ownership":"window switcher"}
+      ,{"region":"terminal","wide":"tab strip, title/actions, dense output pane","mid_1024":"tab labels truncate with full title on demand","mid_768":"tab strip scrolls and actions remain keyboard reachable","narrow_390":"single active tab with explicit tab switcher and safe horizontal output","verify_at":[390,768,1024,1440],"ownership":"terminal surface"},
+      {"region":"Game Mode settings","wide":"confidence, evidence reasons, profile, cache/restore status, and explicit control","mid_1024":"evidence remains visible while secondary copy compresses","mid_768":"status and primary action stay above details","narrow_390":"one-column control with expandable evidence and restore state","verify_at":[390,768,1024,1440],"ownership":"settings/game-mode surface"}
+    ]
+  },
+  "accessibility_contract": {
+    "semantics":"Use native keyboard/focus semantics in the compositor model and expose accessible names for every app, notification, control, and window action.",
+    "focus":"Gallery search is first focus on open; Settings exposes a sidebar/content focus ring and skips status-only rows; sheets trap/restore focus where appropriate; Escape closes transient surfaces; Alt-Tab release restores focus to selected window; pointer focus and keyboard focus expose the same action target.",
+    "contrast":"Text and icons use opaque backing in worst wallpaper frames; selected/error/disabled states are not color-only.",
+    "motion":"Reduced-motion and reduced-transparency preferences are authored variants; no essential meaning depends on blur, bounce, or continuous movement.",
+    "targets":"Pointer targets are at least 24x24 CSS-equivalent logical pixels, with ~44px ergonomic targets for primary desktop controls when space allows; hover is supplementary and never the only indication of an action.",
+    "async":"Install, backend probing, and notification insertion announce state changes without stealing focus; failures name cause and next action.",
+    "reflow":"Long localized labels wrap or disclose without clipping at narrow widths and text scale."
+  },
+  "perf_budget": {
+    "initial_js_kb": 1,
+    "third_party_kb": 0,
+    "media_initial_kb": 1600,
+    "animation_cap_ms": 700,
+    "gpu_frame_ms": 16.7,
+    "max_dpr": 1.5,
+    "image_strategy":"Decode wallpaper once, reserve icon bounds, lazy-load non-visible catalog art, and use opaque color fallback when image/GPU paths fail.",
+    "video_strategy":null,
+    "font_budget":"Use installed system font or one fallback; no remote font fetch.",
+    "hydration_sensitive_elements":[],
+    "lcp_element":"workspace wallpaper/first usable shell frame",
+    "interaction_latency_concerns":["search/filter should avoid scanning on every draw","pointer motion should coalesce and redraw only when hit/hover state changes","Alt-Tab must not allocate unbounded previews","Flatpak subprocess output must not block the event loop","notifications must cap grouped history","PTY output must be drained without blocking the compositor and scrollback must stay bounded","Game Mode detection should sample on a timer/event boundary, not scan processes every frame"],
+    "offscreen_pause_required":true
+  },
+  "evidence_refs":[
+    {"status":"OBSERVED","claim":"Current shell already models top bar, dock, launcher, settings, Game Mode presentation rows, widgets, wallpaper, chrome, and nested OpenGL rendering."},
+    {"status":"OBSERVED","claim":"Nested input forwards pointer motion to clients while suppressing redundant shell redraws, reserves shell shortcuts before client forwarding, and gates shell activation to the primary pointer button."},
+    {"status":"INFERRED","claim":"Flatpak and Vulkan are host capabilities and may be missing; degraded behavior is a product requirement, not a test shortcut."},
+    {"status":"UNVERIFIED","claim":"Native DRM/libinput, real Flathub network access, Vulkan context-loss recovery, and rendered wide/mid/narrow screenshots require a Linux runtime matrix."}
+  ],
+  "verification_state": {
+    "capabilities_used":["filesystem","cargo source inspection","unit-test/build commands when available"],
+    "gap_ledger":[
+      {"boundary":"Flatpak remote catalog/install","status":"still-required-for-production","evidence":"requires Linux host with flatpak and network/remote"},
+      {"boundary":"Vulkan device/context and fallback","status":"still-required-for-production","evidence":"current workspace is Windows and renderer is OpenGL nested"},
+      {"boundary":"Rendered responsive and motion matrix","status":"still-required-for-production","evidence":"no Linux compositor display/browser capture available in this session"},
+      {"boundary":"Game Mode core detector/policy integration","status":"still-required-for-production","evidence":"src/game_mode.rs and Settings policy APIs exist, but live Linux process/window/cgroup sampling still needs a supported-host runtime audit"}
+    ],
+    "rendered_matrix":[],
+    "qa_notes":"Use VERIFIED/INFERRED/UNVERIFIED labels in the handoff. Do not claim production-ready native DRM or GPU performance from static source/tests."
+  }
+}

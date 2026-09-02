@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+# Do not stop an active session or touch ~/.config/rouch. A user can select a
+# different session before removing the package.
+exit 0

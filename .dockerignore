@@ -1,0 +1,6 @@
+.git
+.gitignore
+target
+*.log
+session-*.md
+docker/.cache

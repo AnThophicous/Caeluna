@@ -1,0 +1,15 @@
+#!/bin/sh
+# Compatibility launcher for running Rouch inside an existing desktop.
+set -eu
+
+binary=${ROUCH_BIN:-/usr/bin/rouch}
+if [ "${1-}" = "--nested" ]; then
+    shift
+fi
+if [ ! -x "$binary" ]; then
+    printf '%s\n' "Rouch nested launcher: executable not found: $binary" >&2
+    exit 127
+fi
+
+export ROUCH_LAUNCH_MODE=nested
+exec "$binary" --nested "$@"

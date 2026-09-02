@@ -1,0 +1,19 @@
+Source: rouch
+Section: x11
+Priority: optional
+Maintainer: Rouch Project <maintainers@rouch.invalid>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, libwayland-dev, libxkbcommon-dev, libegl1-mesa-dev, libgl1-mesa-dev, libvulkan-dev, libdrm-dev, libgbm-dev, libudev-dev, libinput-dev, libseat-dev, wayland-protocols
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: rouch
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libc6, libwayland-server0, libxkbcommon0, libegl1, libgl1, libvulkan1, libdrm2, libgbm1, libinput10, libseat1 | libseat2
+Recommends: xwayland, seatd, flatpak, mesa-vulkan-drivers, libgl1-mesa-dri, xdg-desktop-portal, xdg-desktop-portal-gtk, dbus-user-session
+Suggests: systemd | elogind
+Description: Rouch Liquid Glass Wayland desktop
+ Rouch is a lightweight Wayland desktop with a Liquid Glass visual identity,
+ native Flatpak gallery, notifications and a low-end OpenGL/software fallback.
+ .
+ The package installs an opt-in Wayland session. It does not enable a user
+ service, change the display manager, or remove user configuration on upgrade.

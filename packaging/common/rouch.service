@@ -1,0 +1,19 @@
+[Unit]
+Description=Rouch Liquid Glass Wayland compositor (opt-in)
+Documentation=https://github.com/rouch-desktop/rouch
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rouch-session --session
+Restart=on-failure
+RestartSec=2s
+OOMScoreAdjust=-100
+Environment=RUST_LOG=rouch=info
+
+# This unit is deliberately installed disabled. Display managers should use
+# /usr/share/wayland-sessions/rouch.desktop so seat/VT ownership is explicit.
+
+[Install]
+WantedBy=graphical-session.target

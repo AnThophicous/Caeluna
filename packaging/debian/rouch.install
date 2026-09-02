@@ -1,0 +1,8 @@
+usr/bin/rouch
+usr/bin/rouch-session
+usr/bin/rouch-nested
+usr/share/applications/rouch.desktop
+usr/share/wayland-sessions/rouch.desktop
+usr/lib/systemd/user/rouch.service
+usr/share/rouch/interface-stage1/Wallpaper.webp
+usr/share/rouch/interface-stage1/Icon-Composer.webp

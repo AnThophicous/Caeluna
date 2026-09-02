@@ -1,0 +1,47 @@
+pkgname=rouch
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Rouch Liquid Glass Wayland desktop'
+arch=('x86_64' 'aarch64' 'armv7h')
+url='https://github.com/rouch-desktop/rouch'
+license=('MIT' 'Apache')
+depends=('wayland' 'libxkbcommon' 'libdrm' 'libinput' 'seatd'
+         'xorg-xwayland' 'vulkan-icd-loader' 'vulkan-swrast' 'mesa' 'libglvnd'
+         'flatpak' 'xdg-desktop-portal' 'xdg-desktop-portal-gtk' 'dbus')
+makedepends=('rust' 'cargo' 'pkgconf' 'wayland-protocols')
+install=rouch.install
+source=()
+sha256sums=()
+
+prepare() {
+    local source_root="${ROUCH_SOURCE_DIR:-${startdir}/../..}"
+    [[ -f "$source_root/Cargo.toml" ]] ||
+        error "Cargo.toml not found; run makepkg from this checkout or set ROUCH_SOURCE_DIR"
+    mkdir -p "$srcdir/rouch"
+    for item in Cargo.toml Cargo.lock src packaging Wallpaper.webp Icon-Composer.webp; do
+        [[ -e "$source_root/$item" ]] || continue
+        cp -a "$source_root/$item" "$srcdir/rouch/"
+    done
+}
+
+build() {
+    cargo build --locked --release --features native-session --manifest-path "$srcdir/rouch/Cargo.toml"
+}
+
+package() {
+    local root="$srcdir/rouch/packaging/common"
+
+    install -Dm755 "$srcdir/rouch/target/release/rouch" "$pkgdir/usr/bin/rouch"
+    install -Dm755 "$root/rouch-session" "$pkgdir/usr/bin/rouch-session"
+    install -Dm755 "$root/rouch-nested" "$pkgdir/usr/bin/rouch-nested"
+    install -Dm644 "$root/rouch.desktop" "$pkgdir/usr/share/applications/rouch.desktop"
+    install -Dm644 "$root/rouch-wayland-session.desktop" \
+        "$pkgdir/usr/share/wayland-sessions/rouch.desktop"
+    install -Dm644 "$root/rouch.service" "$pkgdir/usr/lib/systemd/user/rouch.service"
+    install -Dm644 "$srcdir/rouch/Wallpaper.webp" \
+        "$pkgdir/usr/share/rouch/interface-stage1/Wallpaper.webp"
+    if [[ -f "$srcdir/rouch/Icon-Composer.webp" ]]; then
+        install -Dm644 "$srcdir/rouch/Icon-Composer.webp" \
+            "$pkgdir/usr/share/rouch/interface-stage1/Icon-Composer.webp"
+    fi
+}
