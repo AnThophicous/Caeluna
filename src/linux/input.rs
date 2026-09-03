@@ -10,8 +10,12 @@
 //! key-repeat catch-up is bounded, and every seat loss or device removal can
 //! cancel a grab before focus is allowed to become stale.
 
+#[cfg(feature = "native-session")]
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "native-session")]
+use std::rc::Rc;
 
 /// Initial delay before a held key begins repeating.
 pub const DEFAULT_REPEAT_DELAY_MS: u64 = 400;
@@ -691,6 +695,8 @@ pub struct InputNormalizer {
     active_grab: Option<u64>,
     devices: HashMap<DeviceId, DeviceKind>,
     last_time_us: u64,
+    #[cfg(feature = "native-session")]
+    absolute_output_size: Option<(i32, i32)>,
 }
 
 impl Default for InputNormalizer {
@@ -708,7 +714,16 @@ impl InputNormalizer {
             active_grab: None,
             devices: HashMap::new(),
             last_time_us: 0,
+            #[cfg(feature = "native-session")]
+            absolute_output_size: None,
         }
+    }
+
+    /// Set the native output size used to convert libinput's absolute
+    /// millimetre coordinates into compositor logical pixels.
+    #[cfg(feature = "native-session")]
+    pub fn set_absolute_output_size(&mut self, width: i32, height: i32) {
+        self.absolute_output_size = Some((width.max(1), height.max(1)));
     }
 
     /// Access current focus without allowing callers to mutate it silently.
@@ -919,10 +934,15 @@ impl InputNormalizer {
             }
             SmithayInputEvent::PointerMotionAbsolute { event } => {
                 let device = event.device();
+                let (x, y) = if let Some((width, height)) = self.absolute_output_size {
+                    (event.x_transformed(width), event.y_transformed(height))
+                } else {
+                    (event.x(), event.y())
+                };
                 vec![NormalizedInputEvent::PointerMotionAbsolute {
                     time_us: self.timestamp(event.time()),
-                    x: finite(event.x()),
-                    y: finite(event.y()),
+                    x: finite(x),
+                    y: finite(y),
                     device: device.id(),
                 }]
             }
@@ -1102,11 +1122,11 @@ fn classify_smithay_device(
 ) -> DeviceKind {
     use smithay::backend::input::{Device as SmithayDevice, DeviceCapability};
     classify_device_capabilities(
-        device.has_capability(DeviceCapability::Keyboard),
-        device.has_capability(DeviceCapability::Pointer),
-        device.has_capability(DeviceCapability::Touch),
-        device.has_capability(DeviceCapability::TabletTool),
-        device.has_capability(DeviceCapability::Gesture),
+        device.has_capability(DeviceCapability::Keyboard.into()),
+        device.has_capability(DeviceCapability::Pointer.into()),
+        device.has_capability(DeviceCapability::Touch.into()),
+        device.has_capability(DeviceCapability::TabletTool.into()),
+        device.has_capability(DeviceCapability::Gesture.into()),
     )
 }
 
@@ -1204,9 +1224,63 @@ impl std::error::Error for NativeInputError {}
 /// normalized Rouch events directly.
 #[cfg(feature = "native-session")]
 #[derive(Debug)]
+struct SharedInputState {
+    normalizer: InputNormalizer,
+    pending: Vec<NormalizedInputEvent>,
+}
+
+#[cfg(feature = "native-session")]
+#[derive(Clone, Debug)]
+pub struct LibinputSeatHandle {
+    shared: Rc<RefCell<SharedInputState>>,
+}
+
+#[cfg(feature = "native-session")]
+impl LibinputSeatHandle {
+    /// Queue the focus/grab transition caused by a libseat event.
+    pub fn session_event(&self, event: smithay::backend::session::Event) {
+        let events = self
+            .shared
+            .borrow_mut()
+            .normalizer
+            .normalizer_session_event(event);
+        self.shared.borrow_mut().pending.extend(events);
+    }
+
+    /// Queue bounded synthetic key-repeat events for the next compositor tick.
+    pub fn repeat_tick(&self, now_ms: u64) {
+        let events = self.shared.borrow_mut().normalizer.repeat_tick(now_ms);
+        self.shared.borrow_mut().pending.extend(events);
+    }
+
+    /// Drain events generated outside libinput's fd source.
+    pub fn drain_events(&self) -> Vec<NormalizedInputEvent> {
+        std::mem::take(&mut self.shared.borrow_mut().pending)
+    }
+}
+
+#[cfg(feature = "native-session")]
+impl InputNormalizer {
+    fn normalizer_session_event(
+        &mut self,
+        event: smithay::backend::session::Event,
+    ) -> Vec<NormalizedInputEvent> {
+        match event {
+            smithay::backend::session::Event::PauseSession => {
+                self.set_seat_active(false, GrabCancelReason::SeatPaused)
+            }
+            smithay::backend::session::Event::ActivateSession => {
+                self.set_seat_active(true, GrabCancelReason::SeatPaused)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native-session")]
+#[derive(Debug)]
 pub struct LibinputSeatSource {
     backend: smithay::backend::libinput::LibinputInputBackend,
-    normalizer: InputNormalizer,
+    shared: Rc<RefCell<SharedInputState>>,
     seat_name: String,
 }
 
@@ -1216,8 +1290,8 @@ impl LibinputSeatSource {
     ///
     /// The session is moved into Smithay's `LibinputSessionInterface`, so
     /// devices are opened through libseat/logind rather than direct `/dev`
-    /// access.  The separate libseat notifier still needs to be installed by
-    /// the integrator and forwarded to [`Self::session_event`].
+    /// access. The native event loop shares this source's handle with the
+    /// libseat notifier for focus cancellation and key-repeat timing.
     pub fn new<S>(session: S, seat: impl Into<String>) -> Result<Self, NativeInputError>
     where
         S: smithay::backend::session::Session + 'static,
@@ -1231,7 +1305,10 @@ impl LibinputSeatSource {
 
         Ok(Self {
             backend: smithay::backend::libinput::LibinputInputBackend::new(context),
-            normalizer: InputNormalizer::default(),
+            shared: Rc::new(RefCell::new(SharedInputState {
+                normalizer: InputNormalizer::default(),
+                pending: Vec::new(),
+            })),
             seat_name,
         })
     }
@@ -1241,32 +1318,37 @@ impl LibinputSeatSource {
         &self.seat_name
     }
 
-    /// Access the normalizer for timer ticks, focus and grab integration.
-    pub fn normalizer(&self) -> &InputNormalizer {
-        &self.normalizer
-    }
-
-    /// Mutably access the normalizer for compositor integration.
-    pub fn normalizer_mut(&mut self) -> &mut InputNormalizer {
-        &mut self.normalizer
-    }
-
-    /// Forward a session pause/resume from Smithay's libseat notifier.
-    pub fn session_event(&mut self, event: smithay::backend::session::Event) -> Vec<NormalizedInputEvent> {
-        match event {
-            smithay::backend::session::Event::PauseSession => self
-                .normalizer
-                .set_seat_active(false, GrabCancelReason::SeatPaused),
-            smithay::backend::session::Event::ActivateSession => self
-                .normalizer
-                .set_seat_active(true, GrabCancelReason::SeatPaused),
+    /// Cloneable bridge shared with the native frame timer and seat notifier.
+    pub fn handle(&self) -> LibinputSeatHandle {
+        LibinputSeatHandle {
+            shared: Rc::clone(&self.shared),
         }
     }
 
+    /// Access the normalizer for timer ticks, focus and grab integration.
+    pub fn normalizer(&self) -> Ref<'_, InputNormalizer> {
+        Ref::map(self.shared.borrow(), |shared| &shared.normalizer)
+    }
+
+    /// Mutably access the normalizer for compositor integration.
+    pub fn normalizer_mut(&self) -> RefMut<'_, InputNormalizer> {
+        RefMut::map(self.shared.borrow_mut(), |shared| &mut shared.normalizer)
+    }
+
+    /// Forward a session pause/resume from Smithay's libseat notifier.
+    pub fn session_event(&self, event: smithay::backend::session::Event) -> Vec<NormalizedInputEvent> {
+        self.handle().session_event(event);
+        self.handle().drain_events()
+    }
+
     /// Forward host deactivation when native output/session focus is lost.
-    pub fn host_deactivated(&mut self) -> Vec<NormalizedInputEvent> {
-        self.normalizer
-            .set_seat_active(false, GrabCancelReason::HostDeactivated)
+    pub fn host_deactivated(&self) -> Vec<NormalizedInputEvent> {
+        let events = self
+            .shared
+            .borrow_mut()
+            .normalizer
+            .set_seat_active(false, GrabCancelReason::HostDeactivated);
+        events
     }
 }
 
@@ -1287,8 +1369,9 @@ impl smithay::reexports::calloop::EventSource for LibinputSeatSource {
         F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
         use smithay::reexports::calloop::EventSource;
+        let shared = Rc::clone(&self.shared);
         self.backend.process_events(readiness, token, |event, _| {
-            let normalized = self.normalizer.normalize_smithay_event(event);
+            let normalized = shared.borrow_mut().normalizer.normalize_smithay_event(event);
             for event in normalized {
                 callback(event, &mut ());
             }

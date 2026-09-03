@@ -2,19 +2,21 @@
 //!
 //! Smithay 0.7 exposes the real low-level pieces needed by a compositor:
 //! `LibSeatSession`, `DrmDevice`/`DrmDeviceFd`, and `UdevBackend`.  This file
-//! wires those pieces together without pretending that the current Winit
-//! renderer is already a DRM scanout renderer.  It is therefore a native
-//! readiness adapter: it acquires the seat, opens and probes a primary DRM
-//! node, tracks pause/activate and hotplug events, and reports an explicit
-//! not-ready error until the native frame/renderer path is connected.
+//! wires those pieces together and exposes the native GBM/EGL/GLES frame
+//! pipeline. The native entry point also owns the Wayland/Rouch event loop, so
+//! a successful return means the compositor was actually running rather than
+//! merely passing a DRM probe.
 //!
 //! The adapter intentionally leaves connectors in their current state during
 //! probing (`disable_connectors = false`) so a failed launch cannot blank an
-//! existing desktop. A future native compositor can opt into connector reset
-//! only after it owns the VT and has a real renderer/surface to commit.
+//! existing desktop. The first actual frame performs the modeset and later
+//! frames use page-flip; no successful startup is reported before that frame
+//! pipeline is connected to the compositor loop.
 
-use std::{cell::RefCell, fmt, path::PathBuf, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::HashSet, fmt, path::PathBuf, rc::Rc, time::Duration};
 
+#[cfg(feature = "native-session")]
+use smithay::reexports::drm::control::{Mode, ModeTypeFlags, crtc};
 use smithay::{
     backend::{
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType},
@@ -22,7 +24,10 @@ use smithay::{
         udev::{UdevBackend, UdevEvent},
     },
     reexports::{
-        calloop::{EventLoop, LoopHandle},
+        calloop::{
+            EventLoop, LoopHandle,
+            timer::{TimeoutAction, Timer},
+        },
         drm::control::{Device as ControlDevice, connector},
     },
     utils::DeviceFd,
@@ -30,6 +35,10 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::session::{self as session_policy, SessionEnvironment, SessionOptions, VtSwitchPlan};
+
+#[cfg(feature = "native-session")]
+#[path = "native.rs"]
+mod native;
 
 /// The native adapter's recoverable/fatal boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,16 +67,6 @@ impl NativeDrmError {
             kind,
             detail: detail.into(),
         }
-    }
-
-    fn not_ready(report: &NativeDrmReport) -> Self {
-        Self::new(
-            NativeDrmErrorKind::NotReady,
-            format!(
-                "native DRM/KMS resources are ready but native scanout is not wired yet ({})",
-                report.summary()
-            ),
-        )
     }
 }
 
@@ -108,6 +107,15 @@ pub struct NativeMode {
 pub struct NativeOutput {
     pub name: String,
     pub modes: Vec<NativeMode>,
+}
+
+/// The connector/CRTC/mode tuple selected for the one-output P0 pipeline.
+#[cfg(feature = "native-session")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NativeOutputConfig {
+    pub connector: connector::Handle,
+    pub crtc: crtc::Handle,
+    pub mode: Mode,
 }
 
 /// A cheap, cloneable diagnostic snapshot suitable for logging/settings.
@@ -170,6 +178,10 @@ pub struct NativeDrmBackend {
     udev: Option<UdevBackend>,
     device_path: PathBuf,
     device_id: u64,
+    #[cfg(feature = "native-session")]
+    scanout: Option<NativeOutputConfig>,
+    #[cfg(feature = "native-session")]
+    pipeline: Option<native::NativeFramePipeline>,
     report: NativeDrmReport,
     needs_reprobe: bool,
 }
@@ -253,6 +265,10 @@ impl NativeDrmBackend {
             udev: Some(udev),
             device_path: device_path.clone(),
             device_id,
+            #[cfg(feature = "native-session")]
+            scanout: None,
+            #[cfg(feature = "native-session")]
+            pipeline: None,
             report: NativeDrmReport {
                 seat: actual_seat,
                 device: device_path,
@@ -277,6 +293,42 @@ impl NativeDrmBackend {
             ));
         }
 
+        #[cfg(not(feature = "native-session"))]
+        {
+            return Err(NativeDrmError::new(
+                NativeDrmErrorKind::NotReady,
+                "native-session feature is disabled; build with --features native-session",
+            ));
+        }
+
+        #[cfg(feature = "native-session")]
+        {
+            let candidates = scanout_candidates(&backend.device)?;
+            let mut last_pipeline_error = None;
+            for config in candidates {
+                match native::NativeFramePipeline::new(&mut backend.device, config) {
+                    Ok(pipeline) => {
+                        backend.scanout = Some(config);
+                        backend.pipeline = Some(pipeline);
+                        break;
+                    }
+                    Err(error) => last_pipeline_error = Some(error.to_string()),
+                }
+            }
+
+            if backend.pipeline.is_none() {
+                return Err(NativeDrmError::new(
+                    NativeDrmErrorKind::Drm,
+                    format!(
+                        "connected DRM outputs were found, but no GBM/EGL/GLES scanout pipeline could be initialized{}",
+                        last_pipeline_error
+                            .map(|error| format!(": {error}"))
+                            .unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+
         info!(report = %backend.report.summary(), "Native DRM/KMS resources acquired");
         Ok(backend)
     }
@@ -285,9 +337,12 @@ impl NativeDrmBackend {
     ///
     /// The weak callbacks avoid an `Rc` cycle; the caller owns the strong
     /// runtime handle and can drop the event loop to unregister all sources.
-    pub fn install_sources(
+    #[cfg(feature = "native-session")]
+    pub fn install_sources<T: 'static>(
         runtime: &Rc<RefCell<Self>>,
-        handle: &LoopHandle<'_, ()>,
+        handle: &LoopHandle<'_, T>,
+        wake: Option<smithay::reexports::calloop::LoopSignal>,
+        input: super::input::LibinputSeatHandle,
     ) -> Result<(), NativeDrmError> {
         let (seat_notifier, drm_notifier, udev) = {
             let mut backend = runtime.borrow_mut();
@@ -305,10 +360,25 @@ impl NativeDrmBackend {
         };
 
         let weak_seat = Rc::downgrade(runtime);
+        let seat_wake = wake.clone();
+        let seat_input = input.clone();
         handle
             .insert_source(seat_notifier, move |event, _, _| {
-                if let Some(runtime) = weak_seat.upgrade() {
-                    runtime.borrow_mut().on_session_event(event);
+                seat_input.session_event(event);
+                let failed = if let Some(runtime) = weak_seat.upgrade() {
+                    let mut backend = runtime.borrow_mut();
+                    backend.on_session_event(event);
+                    backend.status() == NativeDrmStatus::Failed
+                } else {
+                    false
+                };
+                if failed {
+                    if let Some(wake) = &seat_wake {
+                        wake.stop();
+                    }
+                }
+                if let Some(wake) = &seat_wake {
+                    wake.wakeup();
                 }
             })
             .map_err(|error| {
@@ -316,19 +386,41 @@ impl NativeDrmBackend {
             })?;
 
         let weak_drm = Rc::downgrade(runtime);
+        let drm_wake = wake.clone();
         handle
             .insert_source(drm_notifier, move |event, _, _| {
-                if let Some(runtime) = weak_drm.upgrade() {
-                    runtime.borrow_mut().on_drm_event(event);
+                let failed = if let Some(runtime) = weak_drm.upgrade() {
+                    let mut backend = runtime.borrow_mut();
+                    backend.on_drm_event(event);
+                    backend.status() == NativeDrmStatus::Failed
+                } else {
+                    false
+                };
+                if let Some(wake) = &drm_wake {
+                    if failed {
+                        wake.stop();
+                    }
+                    wake.wakeup();
                 }
             })
             .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, format!("DRM: {error:?}")))?;
 
         let weak_udev = Rc::downgrade(runtime);
+        let udev_wake = wake;
         handle
             .insert_source(udev, move |event, _, _| {
-                if let Some(runtime) = weak_udev.upgrade() {
-                    runtime.borrow_mut().on_udev_event(event);
+                let failed = if let Some(runtime) = weak_udev.upgrade() {
+                    let mut backend = runtime.borrow_mut();
+                    backend.on_udev_event(event);
+                    backend.status() == NativeDrmStatus::Failed
+                } else {
+                    false
+                };
+                if let Some(wake) = &udev_wake {
+                    if failed {
+                        wake.stop();
+                    }
+                    wake.wakeup();
                 }
             })
             .map_err(|error| {
@@ -360,11 +452,102 @@ impl NativeDrmBackend {
         self.report.status
     }
 
+    #[cfg(feature = "native-session")]
+    pub fn can_render(&self) -> bool {
+        self.report.status == NativeDrmStatus::Active
+            && self
+                .pipeline
+                .as_ref()
+                .is_some_and(native::NativeFramePipeline::can_render)
+    }
+
+    /// Build and submit the scene while the native GLES renderer is bound.
+    #[cfg(feature = "native-session")]
+    pub fn render_frame_with<E, F>(
+        &mut self,
+        clear_color: impl Into<smithay::backend::renderer::Color32F>,
+        build: F,
+    ) -> Result<(), NativeDrmError>
+    where
+        E: smithay::backend::renderer::element::RenderElement<smithay::backend::renderer::gles::GlesRenderer>,
+        F: FnOnce(&mut smithay::backend::renderer::gles::GlesRenderer) -> Result<Vec<E>, String>,
+    {
+        let pipeline = self.pipeline.as_mut().ok_or_else(|| {
+            NativeDrmError::new(
+                NativeDrmErrorKind::NotReady,
+                "native GBM/EGL/GLES pipeline is not active",
+            )
+        })?;
+        pipeline
+            .render_frame_with(clear_color.into(), build)
+            .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+    }
+
+    /// Render and queue one native frame for the selected output.
+    ///
+    /// The first call performs the pending connector/CRTC/mode commit. Every
+    /// later call must be made only after the matching DRM vblank has reached
+    /// `on_drm_event` (or after the caller has otherwise called
+    /// `frame_submitted`) so the GBM swapchain never reuses an in-flight BO.
+    #[cfg(feature = "native-session")]
+    pub fn render_frame<E>(
+        &mut self,
+        elements: &[E],
+        clear_color: impl Into<smithay::backend::renderer::Color32F>,
+    ) -> Result<(), NativeDrmError>
+    where
+        E: smithay::backend::renderer::element::RenderElement<smithay::backend::renderer::gles::GlesRenderer>,
+    {
+        let pipeline = self.pipeline.as_mut().ok_or_else(|| {
+            NativeDrmError::new(
+                NativeDrmErrorKind::NotReady,
+                "native GBM/EGL/GLES pipeline is not active",
+            )
+        })?;
+        pipeline
+            .render_frame(elements, clear_color.into())
+            .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+    }
+
+    /// Complete the swapchain state for a vblank belonging to this output.
+    ///
+    /// This is public for an integrator that dispatches DRM events itself;
+    /// the built-in notifier calls the same operation automatically.
+    #[cfg(feature = "native-session")]
+    pub fn frame_submitted(&mut self, crtc: crtc::Handle) -> Result<bool, NativeDrmError> {
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return Ok(false);
+        };
+        pipeline
+            .frame_submitted(crtc)
+            .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+    }
+
+    /// Number of frames whose DRM page-flip has reached vblank.
+    #[cfg(feature = "native-session")]
+    pub fn presented_frames(&self) -> u64 {
+        self.pipeline
+            .as_ref()
+            .map_or(0, native::NativeFramePipeline::presented_frames)
+    }
+
+    /// Return the selected physical output and mode, if native resources exist.
+    #[cfg(feature = "native-session")]
+    pub fn scanout_config(&self) -> Option<(crtc::Handle, (u16, u16), u32)> {
+        self.scanout
+            .map(|config| (config.crtc, config.mode.size(), config.mode.vrefresh()))
+    }
+
     fn on_session_event(&mut self, event: session::Event) {
         match event {
             session::Event::PauseSession => {
-                // DrmDevice::pause releases DRM master before the seat is
-                // disabled. Its fd remains owned and can be activated again.
+                // Drop the buffered surface before DrmDevice::pause releases
+                // DRM master. This prevents a pending BO/page-flip from being
+                // reused after VT ownership has gone away.
+                #[cfg(feature = "native-session")]
+                if let Some(pipeline) = self.pipeline.as_mut() {
+                    pipeline.pause();
+                }
                 self.device.pause();
                 self.report.status = NativeDrmStatus::Paused;
                 self.report.outputs.clear();
@@ -377,9 +560,14 @@ impl NativeDrmBackend {
                     self.needs_reprobe = true;
                     if let Err(error) = self.reprobe(true) {
                         self.mark_failure(error);
-                    } else {
-                        info!(report = %self.report.summary(), "Native seat activated and DRM outputs re-probed");
+                        return;
                     }
+                    #[cfg(feature = "native-session")]
+                    if let Err(error) = self.restore_scanout() {
+                        self.mark_failure(error);
+                        return;
+                    }
+                    info!(report = %self.report.summary(), "Native seat activated and DRM outputs re-probed");
                 }
                 Err(error) => {
                     self.mark_failure(NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
@@ -389,11 +577,19 @@ impl NativeDrmBackend {
     }
 
     fn on_drm_event(&mut self, event: DrmEvent) {
-        if let DrmEvent::Error(error) = event {
-            self.mark_failure(NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()));
+        match event {
+            #[cfg(feature = "native-session")]
+            DrmEvent::VBlank(crtc) => {
+                if let Err(error) = self.frame_submitted(crtc) {
+                    self.mark_failure(error);
+                }
+            }
+            #[cfg(not(feature = "native-session"))]
+            DrmEvent::VBlank(_) => {}
+            DrmEvent::Error(error) => {
+                self.mark_failure(NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()));
+            }
         }
-        // VBlank is intentionally only observed here. The native renderer will
-        // consume it when its real frame queue is connected.
     }
 
     fn on_udev_event(&mut self, event: UdevEvent) {
@@ -424,11 +620,22 @@ impl NativeDrmBackend {
 
         self.needs_reprobe = true;
         if current_device_removed {
-            self.report.status = NativeDrmStatus::Recovering;
+            #[cfg(feature = "native-session")]
+            if let Some(pipeline) = self.pipeline.as_mut() {
+                pipeline.pause();
+            }
             self.report.outputs.clear();
-            self.report.last_error = Some("selected DRM node was removed".to_owned());
+            self.mark_failure(NativeDrmError::new(
+                NativeDrmErrorKind::Device,
+                "selected DRM node was removed; native session cannot safely continue",
+            ));
         } else if let Err(error) = self.reprobe_if_needed() {
             self.mark_failure(error);
+        } else {
+            #[cfg(feature = "native-session")]
+            if let Err(error) = self.restore_scanout() {
+                self.mark_failure(error);
+            }
         }
     }
 
@@ -489,6 +696,64 @@ impl NativeDrmBackend {
         Ok(())
     }
 
+    #[cfg(feature = "native-session")]
+    fn restore_scanout(&mut self) -> Result<(), NativeDrmError> {
+        if !self.device.is_active() {
+            return Ok(());
+        }
+
+        let candidates = scanout_candidates(&self.device)?;
+        if candidates.is_empty() {
+            if let Some(pipeline) = self.pipeline.as_mut() {
+                pipeline.pause();
+            }
+            self.scanout = None;
+            self.report.status = NativeDrmStatus::NoOutputs;
+            return Ok(());
+        }
+
+        // Reuse the existing EGL/GLES context when the selected connector,
+        // CRTC and mode are still valid. Activation only recreates the DRM
+        // surface and GBM swapchain in that case.
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            let config = pipeline.config();
+            if candidates.contains(&config) {
+                pipeline
+                    .activate(&mut self.device)
+                    .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))?;
+                self.scanout = Some(config);
+                self.report.status = NativeDrmStatus::Active;
+                return Ok(());
+            }
+        }
+
+        // Hotplug can invalidate the old connector or mode. Drop its surface
+        // before trying a new tuple so no two native surfaces claim the same
+        // primary plane.
+        self.pipeline.take();
+        let mut last_error = None;
+        for config in candidates {
+            match native::NativeFramePipeline::new(&mut self.device, config) {
+                Ok(pipeline) => {
+                    self.scanout = Some(config);
+                    self.pipeline = Some(pipeline);
+                    self.report.status = NativeDrmStatus::Active;
+                    self.report.last_error = None;
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+
+        Err(NativeDrmError::new(
+            NativeDrmErrorKind::Drm,
+            format!(
+                "DRM outputs are connected, but scanout could not be restored{}",
+                last_error.map(|error| format!(": {error}")).unwrap_or_default()
+            ),
+        ))
+    }
+
     fn mark_failure(&mut self, error: NativeDrmError) {
         warn!(kind = %error.kind, detail = %error.detail, "Native DRM adapter entered recovery state");
         self.report.status = NativeDrmStatus::Failed;
@@ -497,35 +762,183 @@ impl NativeDrmBackend {
     }
 }
 
-/// Run the native readiness path once. A successful probe intentionally returns
-/// `NotReady` because the current Liquid Glass frame compositor is still tied
-/// to the nested Winit surface; `linux.rs` turns that into the configured
-/// nested fallback and drops this backend first.
+/// Run a complete native session: acquire the seat and DRM node, create a
+/// Wayland socket, drive libinput and render the same Rouch scene into a real
+/// GBM/KMS page-flip loop.
+#[cfg(not(feature = "native-session"))]
+pub(super) fn run_native(
+    _options: &SessionOptions,
+    _environment: &SessionEnvironment,
+) -> Result<(), NativeDrmError> {
+    Err(NativeDrmError::new(
+        NativeDrmErrorKind::NotReady,
+        "native-session feature is disabled; build with --features native-session",
+    ))
+}
+
+#[cfg(feature = "native-session")]
 pub(super) fn run_native(
     options: &SessionOptions,
     environment: &SessionEnvironment,
 ) -> Result<(), NativeDrmError> {
-    let mut event_loop: EventLoop<()> = EventLoop::try_new()
+    let mut event_loop: EventLoop<super::Rouch> = EventLoop::try_new()
         .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
     // Declare the event loop first. Rust drops locals in reverse declaration
     // order, so the runtime/device is released before the event-source
     // notifiers release the strong libseat session on every error path.
     let runtime = Rc::new(RefCell::new(NativeDrmBackend::open(options, environment)?));
-    NativeDrmBackend::install_sources(&runtime, &event_loop.handle())?;
+
+    let output_size = runtime
+        .borrow()
+        .scanout_config()
+        .map(|(_, (width, height), _)| (i32::from(width), i32::from(height)).into())
+        .ok_or_else(|| {
+            NativeDrmError::new(
+                NativeDrmErrorKind::NoOutput,
+                "native DRM pipeline has no selected output mode",
+            )
+        })?;
+    let display = smithay::reexports::wayland_server::Display::new()
+        .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
+    let mut state = super::Rouch::new(
+        &mut event_loop,
+        display,
+        output_size,
+        "rouch-native",
+        smithay::utils::Transform::Normal,
+    )
+    .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
+
+    let (input_session, seat_name) = {
+        let backend = runtime.borrow();
+        (backend.seat.clone(), backend.report.seat.clone())
+    };
+    let mut input_source = super::input::LibinputSeatSource::new(input_session, seat_name)
+        .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Seat, error.to_string()))?;
+    input_source
+        .normalizer_mut()
+        .set_absolute_output_size(output_size.w, output_size.h);
+    let input_handle = input_source.handle();
+    input_handle.session_event(smithay::backend::session::Event::ActivateSession);
+
+    NativeDrmBackend::install_sources(
+        &runtime,
+        &event_loop.handle(),
+        Some(state.loop_signal.clone()),
+        input_handle.clone(),
+    )?;
+    event_loop
+        .handle()
+        .insert_source(input_source, |event, _, state| {
+            if state.process_normalized_input_event(event) {
+                state.request_redraw();
+            }
+        })
+        .map_err(|error| {
+            NativeDrmError::new(NativeDrmErrorKind::EventLoop, format!("libinput: {error:?}"))
+        })?;
 
     if let VtSwitchPlan::Request(vt) = session_policy::vt_switch_plan(options, environment) {
         runtime.borrow_mut().change_vt(vt)?;
     }
 
-    // Drain already-pending enable/disable/hotplug messages without entering a
-    // second compositor loop. This is enough to prove source registration and
-    // lets a startup VT event update the diagnostic state before fallback.
+    let frame_runtime = Rc::clone(&runtime);
+    let repeat_input = input_handle.clone();
+    let mut current_output_size = output_size;
+    let mut delivered_presentations = runtime.borrow().presented_frames();
     event_loop
-        .dispatch(Some(Duration::ZERO), &mut ())
+        .handle()
+        .insert_source(Timer::from_duration(Duration::ZERO), move |_, _, state| {
+            if state.tick_session() {
+                state.request_redraw();
+            }
+            if state.poll_terminal() || state.refresh_game_mode_if_due() {
+                state.request_redraw();
+            }
+
+            repeat_input.repeat_tick(state.notification_now_ms());
+            let pending_input = repeat_input.drain_events();
+            if !pending_input.is_empty() {
+                for event in pending_input {
+                    if state.process_normalized_input_event(event) {
+                        state.request_redraw();
+                    }
+                }
+                state.request_redraw();
+            }
+
+            // A Wayland frame callback means that the compositor actually
+            // presented the previous buffer. Do not acknowledge a client
+            // commit merely because a page-flip request was queued.
+            let presented_frames = frame_runtime.borrow().presented_frames();
+            if presented_frames > delivered_presentations {
+                delivered_presentations = presented_frames;
+                super::nested::complete_native_frame(state);
+            }
+
+            let can_render = frame_runtime.borrow().can_render();
+            if can_render && state.redraw_needed() && !state.output_blank() {
+                if let Some((_, (width, height), _)) = frame_runtime.borrow().scanout_config() {
+                    let native_size = (i32::from(width), i32::from(height)).into();
+                    if native_size != current_output_size {
+                        state.update_output_size(native_size);
+                        current_output_size = native_size;
+                    }
+                }
+                state.reconcile_nested_clients();
+                state.refresh_animations();
+                state.consume_redraw_request();
+                let result = {
+                    let mut backend = frame_runtime.borrow_mut();
+                    backend.render_frame_with::<super::decorations::RouchRenderElements<
+                        smithay::backend::renderer::gles::GlesRenderer,
+                    >, _>([0.015, 0.035, 0.095, 1.0], |renderer| {
+                        Ok(super::nested::build_render_elements(
+                            state,
+                            renderer,
+                            current_output_size,
+                        ))
+                    })
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        warn!(?error, "Could not render native Rouch frame");
+                        frame_runtime.borrow_mut().mark_failure(error);
+                        state.loop_signal.stop();
+                    }
+                }
+            }
+
+            TimeoutAction::ToDuration(Duration::from_millis(16))
+        })
+        .map_err(|error| {
+            NativeDrmError::new(
+                NativeDrmErrorKind::EventLoop,
+                format!("native frame timer: {error:?}"),
+            )
+        })?;
+
+    info!(
+        socket = ?state.socket_name,
+        output = ?output_size,
+        "Rouch native Wayland compositor is ready"
+    );
+    event_loop
+        .run(None, &mut state, |_| {})
         .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
 
     let report = runtime.borrow().report();
-    Err(NativeDrmError::not_ready(&report))
+    if report.status == NativeDrmStatus::Failed {
+        Err(NativeDrmError::new(
+            NativeDrmErrorKind::Drm,
+            report
+                .last_error
+                .unwrap_or_else(|| "native session stopped after an unrecoverable DRM error".to_owned()),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn select_device(udev: &UdevBackend, seat: &str) -> Result<PathBuf, NativeDrmError> {
@@ -551,6 +964,82 @@ fn select_device(udev: &UdevBackend, seat: &str) -> Result<PathBuf, NativeDrmErr
                 format!("udev found no primary GPU for seat {seat:?}"),
             )
         })
+}
+
+/// Build connector/CRTC/mode tuples in the order a compositor should try
+/// them.  A connector's encoder mask is the authoritative compatibility
+/// relationship; merely pairing the first connector with the first CRTC can
+/// pass a superficial probe and still fail the first modeset ioctl.
+#[cfg(feature = "native-session")]
+fn scanout_candidates(device: &DrmDevice) -> Result<Vec<NativeOutputConfig>, NativeDrmError> {
+    let resources = device
+        .resource_handles()
+        .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))?;
+    let mut candidates = Vec::new();
+
+    for connector_handle in resources.connectors().iter().copied() {
+        let connector_info = device
+            .get_connector(connector_handle, true)
+            .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))?;
+        if connector_info.state() != connector::State::Connected || connector_info.modes().is_empty() {
+            continue;
+        }
+
+        let mut modes = connector_info.modes().to_vec();
+        modes.sort_by(|left, right| {
+            let left_preferred = left.mode_type().contains(ModeTypeFlags::PREFERRED);
+            let right_preferred = right.mode_type().contains(ModeTypeFlags::PREFERRED);
+            let (left_width, left_height) = left.size();
+            let (right_width, right_height) = right.size();
+
+            right_preferred
+                .cmp(&left_preferred)
+                .then_with(|| {
+                    (right_width as u32 * right_height as u32).cmp(&(left_width as u32 * left_height as u32))
+                })
+                .then_with(|| right.vrefresh().cmp(&left.vrefresh()))
+        });
+
+        let mut encoder_handles = connector_info.encoders().to_vec();
+        if let Some(current_encoder) = connector_info.current_encoder() {
+            encoder_handles.sort_by_key(|handle| *handle != current_encoder);
+        }
+
+        let mut crtcs = Vec::new();
+        let mut seen_crtcs = HashSet::new();
+        for encoder_handle in encoder_handles {
+            let encoder = device
+                .get_encoder(encoder_handle)
+                .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))?;
+
+            // Prefer the CRTC that is already driving this connector so the
+            // first frame can reuse an existing mode without a needless
+            // connector hand-off.  The possible-CRTC mask remains the
+            // fallback for hotplug and inactive outputs.
+            if let Some(current_crtc) = encoder.crtc() {
+                if seen_crtcs.insert(current_crtc) {
+                    crtcs.push(current_crtc);
+                }
+            }
+            for crtc in resources.filter_crtcs(encoder.possible_crtcs()) {
+                if seen_crtcs.insert(crtc) {
+                    crtcs.push(crtc);
+                }
+            }
+        }
+
+        for mode in modes {
+            for crtc in &crtcs {
+                candidates.push(NativeOutputConfig {
+                    connector: connector_handle,
+                    crtc: *crtc,
+                    mode,
+                });
+            }
+        }
+    }
+
+    Ok(candidates)
 }
 
 #[cfg(test)]

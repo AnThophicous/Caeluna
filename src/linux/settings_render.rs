@@ -460,6 +460,7 @@ fn paint_row(
                 "Edit",
             );
         }
+        Setting::Section { .. } => unreachable!("section rows are rendered before interactive rows"),
     }
 }
 

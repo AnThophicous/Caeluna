@@ -186,7 +186,8 @@ fn read_cgroup(pid: u32) -> Option<CgroupSnapshot> {
     let bytes = read_limited(&root.join("cgroup"), 4096)?;
     let mut paths = Vec::new();
     let mut controllers = Vec::new();
-    for line in String::from_utf8_lossy(&bytes).lines().take(16) {
+    let text = String::from_utf8_lossy(&bytes);
+    for line in text.lines().take(16) {
         let Some((controller_text, path)) = line.split_once("::") else {
             continue;
         };

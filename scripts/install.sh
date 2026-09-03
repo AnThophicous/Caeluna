@@ -1305,7 +1305,11 @@ write_launcher() {
             printf '%s\n' 'export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-Caelune}"'
             printf '%s\n' 'export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"'
         fi
-        printf '%s\n' "exec \"\$binary\" --$mode \"\$@\""
+        if [[ "$mode" == session ]]; then
+            printf '%s\n' 'exec "$binary" --session --no-fallback "$@"'
+        else
+            printf '%s\n' "exec \"\$binary\" --$mode \"\$@\""
+        fi
     } > "$launcher_stage"
     chmod 0755 "$launcher_stage"
 }

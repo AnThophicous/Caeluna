@@ -1,9 +1,9 @@
 //! Linux Wayland server and XDG window-management layer.
 //!
-//! The renderer is intentionally a separate next step. This module already
-//! owns the protocol-correct lifecycle of XDG toplevels and popups, while the
-//! pure `windowing` module owns the desktop rules shared by future pointer,
-//! shortcut, dock and title-bar actions.
+//! The nested and native backends share the same protocol-correct lifecycle of
+//! XDG toplevels/popups and the same scene builder. The pure `windowing` module
+//! owns the desktop rules shared by pointer, shortcut, dock and title-bar
+//! actions.
 
 use std::{ffi::OsString, sync::Arc, time::Instant};
 
@@ -23,7 +23,7 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_seat::WlSeat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Physical, Serial, Size},
+    utils::{Logical, Physical, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
@@ -449,6 +449,8 @@ impl Rouch {
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
         output_size: Size<i32, Physical>,
+        output_name: &str,
+        output_transform: Transform,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
@@ -467,21 +469,16 @@ impl Rouch {
             refresh: 60_000,
         };
         let output = Output::new(
-            "rouch-nested".to_string(),
+            output_name.to_owned(),
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
                 make: "Rouch".into(),
-                model: "Nested Winit output".into(),
+                model: "Rouch output".into(),
             },
         );
         let _output_global = output.create_global::<Self>(&display_handle);
-        output.change_current_state(
-            Some(mode),
-            Some(smithay::utils::Transform::Flipped180),
-            None,
-            Some((0, 0).into()),
-        );
+        output.change_current_state(Some(mode), Some(output_transform), None, Some((0, 0).into()));
         output.set_preferred(mode);
 
         let mut space = Space::default();
@@ -1344,7 +1341,9 @@ impl Rouch {
                 self.settings_apply(key, crate::settings::SettingValue::Choice(next));
                 true
             }
-            crate::settings::Setting::Slider { key, value, min, max } => {
+            crate::settings::Setting::Slider {
+                key, value, min, max, ..
+            } => {
                 let step = ((*max - *min).abs() / 20.0).max(0.01);
                 let next = (*value + step * delta as f32).clamp(*min, *max);
                 self.settings_apply(key, crate::settings::SettingValue::Float(next));
@@ -1747,6 +1746,7 @@ impl Rouch {
             Some(crate::welcome::WelcomeStage::Update) => {
                 !crate::welcome::UpdateFrame::elapsed(self.welcome_started.elapsed()).finished
             }
+            Some(crate::welcome::WelcomeStage::Desktop) => false,
             None => false,
         };
         let dock_animating = self
@@ -2149,7 +2149,7 @@ impl Rouch {
         }
     }
 
-    fn update_output_size(&mut self, size: Size<i32, Physical>) {
+    pub(super) fn update_output_size(&mut self, size: Size<i32, Physical>) {
         let mode = Mode {
             size,
             refresh: 60_000,
@@ -2545,7 +2545,7 @@ fn surface_app_id(surface: &ToplevelSurface) -> Option<String> {
 }
 
 fn surface_client_pid(handle: &DisplayHandle, surface: &ToplevelSurface) -> Option<u32> {
-    let client = surface.client()?;
+    let client = surface.wl_surface().client()?;
     let credentials = client.get_credentials(handle).ok()?;
     let pid = credentials.pid as u32;
     (pid > 0).then_some(pid)

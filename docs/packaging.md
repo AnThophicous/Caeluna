@@ -108,7 +108,7 @@ seat nativo e recorre ao nested somente quando a política de fallback permite;
 
 ```sh
 rouch-nested --nested       # janela dentro de uma sessão existente
-rouch-session --session     # entrada escolhida pelo display manager
+rouch-session --session     # entrada escolhida pelo display manager (native, sem fallback)
 ```
 
 O arquivo de sessão usa `rouch-session --session`; ele não habilita

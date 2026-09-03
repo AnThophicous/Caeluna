@@ -135,7 +135,13 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut event_loop: EventLoop<Rouch> = EventLoop::try_new()?;
     let display: Display<Rouch> = Display::new()?;
-    let mut state = Rouch::new(&mut event_loop, display, output_size)?;
+    let mut state = Rouch::new(
+        &mut event_loop,
+        display,
+        output_size,
+        "rouch-nested",
+        smithay::utils::Transform::Flipped180,
+    )?;
 
     install_winit_backend(&mut event_loop, &mut state, backend, winit)?;
 
@@ -240,6 +246,415 @@ fn install_winit_backend(
     )?;
 
     Ok(())
+}
+
+/// Build the complete Rouch scene for a GLES renderer.  The nested backend
+/// submits this scene through Winit, while the native backend submits the same
+/// elements through its GBM/DRM swapchain.  Keeping scene construction here is
+/// what prevents the native session from becoming a separate, feature-poor
+/// compositor.
+pub(super) fn build_render_elements(
+    state: &mut Rouch,
+    renderer: &mut GlesRenderer,
+    size: smithay::utils::Size<i32, Physical>,
+) -> Vec<super::decorations::RouchRenderElements<GlesRenderer>> {
+    // Snapshot window state first: element construction borrows the renderer
+    // mutably, so all descriptions are collected up front.
+    let descriptions: Vec<(WindowId, crate::windowing::Rect, bool, bool, String)> = state
+        .windows
+        .windows()
+        .iter()
+        .filter(|window| state.nested_window_renderable(window.id()))
+        .map(|window| {
+            (
+                window.id(),
+                window.frame(),
+                window.active(),
+                window.maximized(),
+                window.title().to_owned(),
+            )
+        })
+        .collect();
+
+    // Chrome textures for this frame, one per visible window. The surfaces
+    // map is updated and elements created in one pass; each chrome is then
+    // spliced right after its client's surfaces.
+    let mut chrome: Vec<(
+        WindowId,
+        smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement<GlesRenderer>,
+    )> = {
+        let refs: Vec<(WindowId, crate::windowing::Rect, bool, bool, &str)> = descriptions
+            .iter()
+            .map(|(id, frame, active, maximized, title)| (*id, *frame, *active, *maximized, title.as_str()))
+            .collect();
+        let samples: HashMap<WindowId, _> = refs
+            .iter()
+            .filter_map(|(id, ..)| state.animation_sample(*id).map(|s| (*id, s)))
+            .collect();
+        let sampler = |id: WindowId| samples.get(&id).copied();
+        let elements = state.decorations.render_elements(renderer, &refs, &sampler);
+        elements
+            .into_iter()
+            .zip(refs.iter().map(|(id, ..)| *id))
+            .map(|(element, id)| (id, element))
+            .collect()
+    };
+
+    // Animated opacity is snapshotted before the render pass borrows the
+    // renderer and state together.
+    let alpha_by_id: HashMap<WindowId, f32> = state
+        .windows
+        .windows()
+        .iter()
+        .map(|window| {
+            (
+                window.id(),
+                state
+                    .animation_sample(window.id())
+                    .map(|(_, opacity, _)| opacity)
+                    .unwrap_or(1.0),
+            )
+        })
+        .collect();
+    let surface_alpha = |id: WindowId| -> f32 { alpha_by_id.get(&id).copied().unwrap_or(1.0) };
+
+    use smithay::backend::renderer::element::AsRenderElements;
+    let mut ordered: Vec<super::decorations::RouchRenderElements<GlesRenderer>> = Vec::new();
+
+    // Wallpaper sits beneath everything; the clear colour shows through if
+    // it could not be decoded.
+    if let Some(wallpaper) = state.wallpaper.as_mut() {
+        if let Some(element) =
+            wallpaper.render_element::<GlesRenderer>(renderer, crate::windowing::Size::new(size.w, size.h))
+        {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    // Walk the space back-to-front and interleave each client's chrome.
+    for desktop_window in state.space.elements() {
+        let Some(location) = state.space.element_location(desktop_window) else {
+            continue;
+        };
+        let Some(id) = state
+            .xdg_windows
+            .iter()
+            .find(|binding| &binding.desktop == desktop_window)
+            .map(|binding| binding.id)
+        else {
+            continue;
+        };
+        if !state.nested_window_renderable(id) {
+            continue;
+        }
+
+        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            AsRenderElements::<GlesRenderer>::render_elements(
+                desktop_window,
+                renderer,
+                location.to_physical(1),
+                smithay::utils::Scale::from(1.0),
+                surface_alpha(id),
+            );
+        ordered.extend(
+            surface_elements
+                .into_iter()
+                .map(super::decorations::RouchRenderElements::Surface),
+        );
+
+        if let Some(index) = chrome.iter().position(|(chrome_id, _)| *chrome_id == id) {
+            let (_, element) = chrome.swap_remove(index);
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    for placement in state.nested_popup_placements() {
+        let alpha = surface_alpha(placement.root);
+        let popup_elements: Vec<super::decorations::RouchRenderElements<GlesRenderer>> =
+            render_elements_from_surface_tree(
+                renderer,
+                placement.surface.wl_surface(),
+                placement.location.to_physical(1),
+                smithay::utils::Scale::from(1.0),
+                alpha,
+                Kind::Unspecified,
+            );
+        ordered.extend(popup_elements);
+    }
+
+    if state.terminal_ui.open {
+        if let Some(element) = state.terminal_renderer.element::<GlesRenderer>(
+            renderer,
+            state.windows.work_area(),
+            &state.terminal_ui,
+            &state.fonts,
+            if state.toggles.battery_saver {
+                crate::design::PerformanceProfile::BatterySaver
+            } else {
+                crate::design::PerformanceProfile::default()
+            },
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    // Dock.
+    {
+        let work_area = state.windows.work_area();
+        let pointer = state.seat.get_pointer().map(|pointer| pointer.current_location());
+        let pointer = pointer.map(|location| crate::windowing::Point {
+            x: location.x.round() as i32,
+            y: location.y.round() as i32,
+        });
+        let hover = pointer.and_then(|point| {
+            state
+                .dock
+                .hit(work_area, point)
+                .map(|index| super::dock_render::Hover { index })
+        });
+        let bounces: Vec<f32> = (0..state.dock.items().len())
+            .map(|index| state.dock_bounce(index))
+            .collect();
+        let bounce_fn = |index: usize| bounces.get(index).copied().unwrap_or(0.0);
+
+        if let Some(element) = state.dock_renderer.render_element::<GlesRenderer>(
+            renderer,
+            &state.dock,
+            work_area,
+            pointer,
+            hover,
+            &bounce_fn,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    // Welcome overlay.
+    match state.welcome {
+        Some(crate::welcome::WelcomeStage::FirstRun) => {
+            let frame = crate::welcome::WelcomeFrame::elapsed(state.welcome_started.elapsed());
+            if let Some(element) = state.welcome_renderer.first_run_element::<GlesRenderer>(
+                renderer,
+                state.windows.work_area(),
+                frame,
+            ) {
+                ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+            }
+            if frame.finished {
+                state.dismiss_welcome();
+            }
+        }
+        Some(crate::welcome::WelcomeStage::Update) => {
+            let frame = crate::welcome::UpdateFrame::elapsed(state.welcome_started.elapsed());
+            let notes = crate::welcome::this_release();
+            if let Some(element) = state.welcome_renderer.update_element::<GlesRenderer>(
+                renderer,
+                state.windows.work_area(),
+                frame,
+                &notes,
+            ) {
+                ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+            }
+        }
+        _ => {}
+    }
+
+    state.refresh_readings();
+    state.relayout_shell();
+
+    // Widget rail and its confirmation popup.
+    {
+        let work_area = state.windows.work_area();
+        let board_rect = crate::widgets::WidgetBoard::board_rect(work_area);
+        let readings = &state.readings;
+        let reading_fn = |kind: crate::widgets::WidgetKind| readings.widget(kind);
+        let now_secs = state.now_secs();
+        if let Some(element) = state.widget_renderer.board_element::<GlesRenderer>(
+            renderer,
+            &state.widget_board,
+            board_rect,
+            &reading_fn,
+            now_secs,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+        if let Some(popup) = state.remove_popup.clone() {
+            let anchor = state
+                .widget_board
+                .slots
+                .get(popup.index)
+                .map(|slot| slot.rect(board_rect))
+                .unwrap_or(board_rect);
+            let rect = crate::widgets::popup_rect(anchor, work_area);
+            if let Some(element) = state
+                .widget_renderer
+                .popup_element::<GlesRenderer>(renderer, rect, popup.kind, work_area)
+            {
+                ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+            }
+        }
+    }
+
+    if state.control_open {
+        let work_area = state.windows.work_area();
+        let toggles = state.toggles;
+        let readings = &state.readings;
+        if let Some(element) = state.shell_renderer.control_element::<GlesRenderer>(
+            renderer,
+            work_area,
+            state.control_layout,
+            &toggles,
+            readings,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.finder_open {
+        let work_area = state.windows.work_area();
+        let places: Vec<(String, String)> = crate::finder::sidebar_places()
+            .into_iter()
+            .map(|(label, path)| (label.to_owned(), path.to_owned()))
+            .collect();
+        let items: Vec<crate::finder::FinderItem> = state
+            .finder
+            .filtered(&state.finder_items)
+            .into_iter()
+            .cloned()
+            .collect();
+        if let Some(element) =
+            state
+                .finder_renderer
+                .element::<GlesRenderer>(renderer, work_area, &state.finder, &items, &places)
+        {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.settings_open {
+        let work_area = state.windows.work_area();
+        let rows = {
+            let profile = crate::user::UserProfile {
+                name: state.profile_name(),
+                avatar: crate::user::AvatarSource::default(),
+            };
+            let toggles = state.toggles;
+            state
+                .settings_backend
+                .pane_rows(state.settings_pane, &profile, &toggles)
+        };
+        let layout = crate::settings::layout(work_area, state.settings_pane, rows.len());
+        let profile = crate::user::UserProfile {
+            name: state.profile_name(),
+            avatar: crate::user::AvatarSource::default(),
+        };
+        if let Some(element) = state.settings_renderer.element::<GlesRenderer>(
+            renderer,
+            work_area,
+            layout,
+            state.settings_pane,
+            &rows,
+            &profile,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.app_store_open {
+        let work_area = state.windows.work_area();
+        if let Some(element) = state.app_store_renderer.element::<GlesRenderer>(
+            renderer,
+            work_area,
+            &state.app_store,
+            &state.fonts,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.launcher_open {
+        let work_area = state.windows.work_area();
+        if let Some(element) = paint_launcher(
+            renderer,
+            work_area,
+            &state.applications,
+            &state.launcher_query,
+            &state.fonts,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.notifications_open || (!state.notifications.is_empty() && state.welcome.is_none()) {
+        let now_ms = state.notification_now_ms();
+        if let Some(element) = state.notification_renderer.element::<GlesRenderer>(
+            renderer,
+            state.windows.work_area(),
+            &state.notifications,
+            now_ms,
+            state.notifications_open,
+            &state.fonts,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    if state.setup_open && state.welcome.is_none() {
+        if let Some(element) = state.setup_renderer.element::<GlesRenderer>(
+            renderer,
+            state.windows.work_area(),
+            &state.setup_state,
+            &state.fonts,
+        ) {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    match state.session {
+        crate::idle::Session::Rest => {
+            if let Some(element) = paint_rest_screen(renderer, state.windows.work_area(), &state.fonts) {
+                ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+            }
+        }
+        crate::idle::Session::Lock => {
+            let name = state.profile_name();
+            if let Some(element) = paint_lock_screen(
+                renderer,
+                state.windows.work_area(),
+                &name,
+                &state.password,
+                &state.fonts,
+            ) {
+                ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+            }
+        }
+        _ => {}
+    }
+
+    // Top bar closes the stack.
+    {
+        let work_area = state.windows.work_area();
+        let app_name = state.active_app_name();
+        let clock = crate::topbar::clock_text(state.now_secs());
+        let snapshot = super::shell_render::BarSnapshot {
+            layout: state.topbar_layout,
+            app_name: &app_name,
+            clock: &clock,
+            readings: &state.readings,
+            distribution: state.distribution,
+            unread_notifications: state
+                .notifications
+                .unread_visible_count(state.notification_now_ms()),
+        };
+        if let Some(element) = state
+            .shell_renderer
+            .bar_element::<GlesRenderer>(renderer, work_area, &snapshot)
+        {
+            ordered.push(super::decorations::RouchRenderElements::Chrome(element));
+        }
+    }
+
+    ordered
 }
 
 fn render_frame(
@@ -750,13 +1165,45 @@ fn render_frame(
     }
 }
 
+/// Deliver frame callbacks after a native DRM page-flip was queued. This is
+/// shared with the Winit path so Wayland clients observe the same frame
+/// pacing regardless of which physical backend owns scanout.
+pub(super) fn complete_native_frame(state: &mut Rouch) {
+    let output = state.output.clone();
+    let frame_time = state.started_at.elapsed();
+    for window in state.space.elements() {
+        window.send_frame(&output, frame_time, Some(Duration::ZERO), |_, _| {
+            Some(output.clone())
+        });
+    }
+    for placement in state.nested_popup_placements() {
+        if placement.surface.alive() {
+            send_frames_surface_tree(
+                placement.surface.wl_surface(),
+                &output,
+                frame_time,
+                Some(Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
+        }
+    }
+    state.space.refresh();
+
+    if let Err(error) = state.display_handle.flush_clients() {
+        warn!(
+            ?error,
+            "Could not flush native frame callbacks to Wayland clients"
+        );
+    }
+}
+
 impl Rouch {
     /// Repair the boundary between protocol objects and Smithay's render
     /// space. XDG commits can arrive while a host event is being processed,
     /// and destruction callbacks are not guaranteed to be observed before a
     /// subsequent input event. Every operation below is idempotent so an
     /// incomplete client state degrades to an unmapped, unfocused surface.
-    fn reconcile_nested_clients(&mut self) {
+    pub(super) fn reconcile_nested_clients(&mut self) {
         let dead_ids: Vec<WindowId> = self
             .xdg_windows
             .iter()
@@ -1358,6 +1805,138 @@ impl Rouch {
                 debug!("Ignoring input event not yet handled by the nested backend");
                 false
             }
+        }
+    }
+
+    /// Feed the native libinput normalizer into the same seat and shell path
+    /// used by the nested host backend. The native source transforms absolute
+    /// device coordinates to the selected output before this boundary.
+    pub(super) fn process_normalized_input_event(&mut self, event: input::NormalizedInputEvent) -> bool {
+        use input::{KeyDelivery, NormalizedInputEvent};
+
+        let time_ms = |time_us: u64| -> u32 { (time_us / 1_000).min(u64::from(u32::MAX)) as u32 };
+
+        match event {
+            NormalizedInputEvent::Keyboard(event) => {
+                let state = match event.state {
+                    KeyDelivery::Released => KeyState::Released,
+                    KeyDelivery::Pressed | KeyDelivery::Repeat => KeyState::Pressed,
+                };
+                self.process_keyboard(
+                    smithay::input::keyboard::Keycode::from(event.keycode),
+                    state,
+                    time_ms(event.time_us),
+                )
+            }
+            NormalizedInputEvent::PointerMotion { time_us, dx, dy, .. } => {
+                let Some(previous) = self.seat.get_pointer().map(|pointer| pointer.current_location()) else {
+                    return false;
+                };
+                let output_size = self
+                    .space
+                    .output_geometry(&self.output)
+                    .map(|geometry| geometry.size)
+                    .unwrap_or_else(|| {
+                        let size = self.windows.work_area().size;
+                        (size.width, size.height).into()
+                    });
+                let max_x = output_size.w.saturating_sub(1).max(0) as f64;
+                let max_y = output_size.h.saturating_sub(1).max(0) as f64;
+                let position = SmithayPoint::new(
+                    (previous.x + dx).clamp(0.0, max_x),
+                    (previous.y + dy).clamp(0.0, max_y),
+                );
+                self.note_activity();
+                self.process_motion(position, time_ms(time_us))
+            }
+            NormalizedInputEvent::PointerButton {
+                time_us,
+                button,
+                pressed,
+                ..
+            } => {
+                self.note_activity();
+                self.process_button(
+                    button,
+                    if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                    time_ms(time_us),
+                )
+            }
+            NormalizedInputEvent::PointerMotionAbsolute { time_us, x, y, .. } => {
+                if !x.is_finite() || !y.is_finite() {
+                    return false;
+                }
+                self.note_activity();
+                self.process_motion(SmithayPoint::new(x, y), time_ms(time_us))
+            }
+            NormalizedInputEvent::PointerAxis {
+                time_us,
+                horizontal,
+                vertical,
+                horizontal_v120,
+                vertical_v120,
+                source,
+                ..
+            } => {
+                use smithay::backend::input::{Axis, AxisSource as SmithayAxisSource};
+                use smithay::input::pointer::AxisFrame;
+
+                let source = match source {
+                    input::AxisSource::Wheel => SmithayAxisSource::Wheel,
+                    input::AxisSource::Finger => SmithayAxisSource::Finger,
+                    input::AxisSource::Continuous => SmithayAxisSource::Continuous,
+                    input::AxisSource::Unknown => SmithayAxisSource::Continuous,
+                };
+                let mut frame = AxisFrame::new(time_ms(time_us)).source(source);
+                if horizontal != 0.0 {
+                    frame = frame.value(Axis::Horizontal, horizontal);
+                }
+                if vertical != 0.0 {
+                    frame = frame.value(Axis::Vertical, vertical);
+                }
+                if let Some(value) = horizontal_v120 {
+                    frame = frame.v120(Axis::Horizontal, value.round() as i32);
+                }
+                if let Some(value) = vertical_v120 {
+                    frame = frame.v120(Axis::Vertical, value.round() as i32);
+                }
+                if let Some(pointer) = self.seat.get_pointer() {
+                    pointer.axis(self, frame);
+                    pointer.frame(self);
+                }
+                false
+            }
+            NormalizedInputEvent::DeviceRemoved { .. } => {
+                self.pressed_buttons = 0;
+                self.active_drag = None;
+                false
+            }
+            NormalizedInputEvent::GrabCancelled { .. } => {
+                self.pressed_buttons = 0;
+                self.active_drag = None;
+                false
+            }
+            NormalizedInputEvent::FocusChanged { active, .. } => {
+                if !active {
+                    self.pressed_buttons = 0;
+                    self.active_drag = None;
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        if !keyboard.is_grabbed() {
+                            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                        }
+                    }
+                }
+                false
+            }
+            NormalizedInputEvent::DeviceAdded { .. }
+            | NormalizedInputEvent::GestureSwipe { .. }
+            | NormalizedInputEvent::GesturePinch { .. }
+            | NormalizedInputEvent::GestureHold { .. }
+            | NormalizedInputEvent::Touch { .. } => false,
         }
     }
 

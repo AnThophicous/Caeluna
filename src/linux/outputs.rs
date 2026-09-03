@@ -79,7 +79,7 @@ pub fn select_mode(
     current: Option<OutputMode>,
     request: Option<ModeRequest>,
 ) -> Option<OutputMode> {
-    let valid = modes.iter().copied().filter(OutputMode::is_valid);
+    let valid = modes.iter().copied().filter(|mode| mode.is_valid());
     let modes = valid.collect::<Vec<_>>();
     if modes.is_empty() {
         return None;
@@ -581,7 +581,7 @@ impl OutputRegistry {
         }
 
         self.arrange(strategy);
-        if self.session != SessionState::Active {
+        if !matches!(self.session, SessionState::Active { .. }) {
             self.focused = None;
         } else if self
             .focused
@@ -603,7 +603,7 @@ impl OutputRegistry {
         let mut placements = Vec::with_capacity(ids.len());
         let mut cursor_x = 0i32;
         let mut cursor_y = 0i32;
-        let mut virtual_geometry = None;
+        let mut virtual_geometry: Option<OutputGeometry> = None;
 
         for id in ids {
             let Some(record) = self.outputs.get(&id) else {
@@ -656,7 +656,7 @@ impl OutputRegistry {
         if !self.outputs.contains_key(id) {
             return Err(OutputError::UnknownOutput(id.to_owned()));
         }
-        if self.session != SessionState::Active {
+        if !matches!(self.session, SessionState::Active { .. }) {
             return Err(OutputError::SessionInactive);
         }
         if self.focused.as_deref() == Some(id) {
@@ -669,7 +669,7 @@ impl OutputRegistry {
     /// Focus the next/previous output in deterministic connector order.
     pub fn focus_next(&mut self, reverse: bool) -> Option<OutputChange> {
         let ids = self.ordered_ids();
-        if ids.is_empty() || self.session != SessionState::Active {
+        if ids.is_empty() || !matches!(self.session, SessionState::Active { .. }) {
             return None;
         }
         let current = self
@@ -761,7 +761,7 @@ impl OutputRegistry {
         if !(1..=63).contains(&vt) {
             return Err(OutputError::InvalidVt(vt));
         }
-        if self.session != SessionState::Active {
+        if !matches!(self.session, SessionState::Active { .. }) {
             return Err(OutputError::SessionInactive);
         }
         Ok(VtRequest { vt })

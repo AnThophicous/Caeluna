@@ -10,9 +10,10 @@ da Apple. Caelune não é um produto da Apple e não tem afiliação com ela. Ap
 macOS e Tahoe aparecem neste projeto apenas como referência visual e de
 experiência; o código e os assets distribuídos são próprios ou abertos.
 
-> Estado atual: protótipo funcional para testes da sessão `--nested`. A sessão
-> nativa `--session` já faz probing de seat e DRM, mas o scanout físico ainda
-> não está completo.
+> Estado atual: `--nested` continua sendo o caminho de desenvolvimento; a
+> sessão `--session` agora possui o caminho nativo de Wayland + libinput +
+> GBM/EGL/GLES + DRM/KMS. A validação final ainda precisa ser feita em Linux
+> com seatd/logind e uma GPU/saída compatíveis.
 
 ## O que é o Caelune
 
@@ -166,9 +167,8 @@ Há uma diferença importante entre política e implementação atual:
 - o nested usa hoje Smithay/Winit com `GlesRenderer`, ou seja, OpenGL/EGL;
 - a preferência Vulkan está pronta no modelo e nas decisões de startup, mas um
   renderer Vulkan real para o nested ainda não foi ligado;
-- o caminho nativo tem as dependências opcionais para DRM/GBM, libseat,
-  libinput, udev, Vulkan, pixman e XWayland, mas precisa de validação em uma
-  instalação Linux real;
+- o caminho nativo liga DRM/KMS, GBM/EGL/GLES, libseat, libinput e udev; ainda
+  precisa de validação em uma instalação Linux real;
 - software/opaque é a última política de segurança visual; isso não significa
   que todos os fluxos nativos já estejam prontos nesse modo.
 
@@ -364,9 +364,11 @@ rouch --nested
 rouch --session
 ```
 
-O `--session` tenta adquirir o seat com libseat e abrir o dispositivo DRM
-primário. Se a política de fallback estiver ativa e a sessão nativa não puder
-continuar, o processo libera os recursos e volta para o nested.
+O `--session` adquire o seat com libseat, abre o dispositivo DRM primário,
+cria o socket Wayland e entra no loop nativo de renderização. O binário ainda
+aceita `--fallback-nested` para desenvolvimento, mas o launcher do display
+manager usa `--no-fallback`, evitando que uma sessão gráfica real seja
+silenciosamente substituída por uma janela nested.
 
 O que já foi preparado:
 
@@ -380,9 +382,8 @@ O que já foi preparado:
 
 O que ainda falta para chamar a sessão nativa de pronta:
 
-- criar e manter o renderer nativo de scanout;
-- fazer modeset e page-flip DRM reais;
-- completar o event loop de pausa/retorno de seat, VT e outputs;
+- validar pause/activate, VT, hotplug e troca de modo em hardware real;
+- completar suporte multi-output e a política de seleção de output;
 - ligar de ponta a ponta a ponte XWayland e os protocolos de clipboard,
   portais, screencast e notificações externas;
 - testar a matriz completa em hardware real Mint, Ubuntu e Arch.
@@ -445,7 +446,7 @@ etapa própria para não quebrar instalações existentes.
 
 1. integrar o tutorial completo da primeira execução;
 2. concluir o terminal próprio com PTY, UTF-8, abas e configuração visual;
-3. ligar renderer, modeset, page-flip e event loop da sessão DRM nativa;
+3. validar pause/activate, hotplug, VT e múltiplos outputs em hardware real;
 4. validar Vulkan real e fallback OpenGL/software em hardware suportado;
 5. completar XWayland, clipboard, portais, screencast e notificações externas;
 6. medir frame time, memória e consumo em PC fraco, substituindo proxies por

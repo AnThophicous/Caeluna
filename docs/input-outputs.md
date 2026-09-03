@@ -165,29 +165,32 @@ integrador e não foi inventado neste módulo.
 
 ## Verificação feita
 
-Foi aplicado `rustfmt`/checagem de parsing aos dois módulos. Os testes dentro
-dos módulos são puros: seleção de backend, repeat limitado, sanitização de
-motion, cancelamento de grab, seleção de modo, escala inválida, layout
-HiDPI, foco direcional, hotplug, pausa/retorno de VT e parsing de sysfs.
+Foi aplicado `rustfmt` e os testes puros cobrem seleção de backend, repeat
+limitado, sanitização de motion, cancelamento de grab, seleção de modo, escala
+inválida, layout HiDPI, foco direcional, hotplug, pausa/retorno de VT e parsing
+de sysfs. O caminho nativo também possui a integração de runtime, mas sua
+checagem final exige bibliotecas Linux e uma saída DRM real.
 
 ## Limitações explícitas
 
-- Os módulos não editam o event loop nem fazem modeset DRM automaticamente.
+- A entrada nativa instala fontes calloop para libseat, DRM, udev e libinput;
+  o compositor nativo faz o primeiro modeset e os page-flips através de
+  `GbmBufferedSurface`.
 - Sysfs fornece dimensões e modos básicos; EDID detalhado (make/model/mm) e
   seleção de CRTC/connector precisam ser preenchidos pelo scanner DRM do
   integrador quando necessário.
-- `UdevOutputSource` sinaliza uma nova varredura; não presume que um evento de
-  GPU seja um monitor específico.
+- `UdevOutputSource` sinaliza uma nova varredura; o runtime nativo seleciona
+  novamente connector/encoder/CRTC/mode e recria a superfície quando possível.
 - Clipboard, drag-and-drop, portais, PipeWire/screencast, notificações
   Wayland e XWayland exigem protocolos/handlers próprios e ficam fora destes
   dois módulos.
 - Vulkan, OpenGL e pixman/software são políticas do renderer. A entrada e a
   geometria funcionam em qualquer um deles, inclusive no fallback opaco de PC
   fraco.
-- A troca de VT é encaminhada por libseat somente depois de
-  `OutputRegistry::request_vt` validar o número; a criação da sessão, o
-  display manager e o arquivo `.desktop` de `/usr/share/wayland-sessions`
-  continuam sendo responsabilidade do instalador/integrador.
+- A troca de VT é encaminhada por libseat somente depois de validar o número;
+  a criação da sessão, o display manager e o arquivo `.desktop` de
+  `/usr/share/wayland-sessions` continuam sendo responsabilidade do
+  instalador/integrador.
 
 ## Navegacao no Caelune
 
