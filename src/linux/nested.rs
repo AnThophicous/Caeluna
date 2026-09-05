@@ -155,6 +155,9 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         // display of this resolution would have. Zero would make every toolkit
         // compute a DPI of zero.
         physical_size_at_96_dpi(output_size),
+        // A nested window presents through the host compositor, whose own rate
+        // is not observable from here. 60 Hz is the honest default.
+        60_000,
     )?;
 
     install_winit_backend(&mut event_loop, &mut state, backend, winit)?;

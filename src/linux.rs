@@ -557,6 +557,9 @@ pub struct Rouch {
     xdg_windows: Vec<XdgWindow>,
     popups: Vec<PopupSurface>,
     output: Output,
+    /// The panel's real refresh rate in millihertz, kept so a resize does not
+    /// silently rewrite it.
+    output_refresh_millihertz: i32,
     space: Space<DesktopWindow>,
     loop_signal: smithay::reexports::calloop::LoopSignal,
     /// Dirty bit consumed by the nested compositor before each frame. Native
@@ -696,6 +699,7 @@ impl Rouch {
         output_name: &str,
         output_transform: Transform,
         physical_size_mm: Size<i32, smithay::utils::Physical>,
+        refresh_millihertz: i32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
@@ -722,7 +726,7 @@ impl Rouch {
 
         let mode = Mode {
             size: output_size,
-            refresh: 60_000,
+            refresh: refresh_millihertz,
         };
         let output = Output::new(
             output_name.to_owned(),
@@ -774,6 +778,7 @@ impl Rouch {
             xdg_windows: Vec::new(),
             popups: Vec::new(),
             output,
+            output_refresh_millihertz: refresh_millihertz,
             space,
             loop_signal: event_loop.get_signal(),
             redraw_pending: true,
@@ -2530,7 +2535,10 @@ impl Rouch {
     pub(super) fn update_output_size(&mut self, size: Size<i32, Physical>) {
         let mode = Mode {
             size,
-            refresh: 60_000,
+            // A resize does not change the panel's refresh rate, and telling a
+            // client it did would make every video player re-derive its
+            // cadence from a number the compositor invented.
+            refresh: self.output_refresh_millihertz,
         };
         self.output.change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
@@ -2832,6 +2840,32 @@ impl Rouch {
         self.prepare_client_command(&mut command);
         if let Err(error) = command.spawn() {
             warn!(program, ?error, "Could not launch application");
+        }
+    }
+
+    /// Keep a browser's picture-in-picture window above ordinary windows.
+    ///
+    /// Wayland has no protocol for this, so it is a rule rather than a request:
+    /// the window is an ordinary toplevel and would otherwise sink behind
+    /// whatever the user clicks next, which defeats the point of detaching the
+    /// video in the first place. The rule is reversible, so a window that stops
+    /// being a video drops back to the normal layer.
+    fn apply_floating_video_rule(&mut self, id: WindowId) {
+        let Some(window) = self.windows.window(id) else {
+            return;
+        };
+        let app_id = self.window_apps.get(&id).map(String::as_str).unwrap_or_default();
+        let floating = crate::windowing::is_picture_in_picture(app_id, window.title());
+        if floating == window.always_on_top() {
+            return;
+        }
+        if self.windows.set_always_on_top(id, floating) {
+            info!(
+                window_id = id.raw(),
+                floating, "Applied the floating video rule to a window"
+            );
+            self.reconfigure_windows();
+            self.request_redraw();
         }
     }
 
@@ -3297,6 +3331,7 @@ impl XdgShellHandler for Rouch {
                 self.window_apps.insert(id, app_id.clone());
                 self.dock.window_mapped(&app_id, &app_id);
                 debug!(window_id = id.raw(), app_id = %app_id, "XDG app id changed");
+                self.apply_floating_video_rule(id);
             }
         }
     }
@@ -3316,6 +3351,9 @@ impl XdgShellHandler for Rouch {
             if self.windows.set_title(id, &title) {
                 debug!(window_id = id.raw(), title = %title, "XDG title changed");
             }
+            // A browser names its picture-in-picture window only after it maps,
+            // so the rule is re-evaluated on every title change.
+            self.apply_floating_video_rule(id);
         }
     }
 

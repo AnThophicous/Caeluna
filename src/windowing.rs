@@ -1415,6 +1415,44 @@ impl WindowManager {
     }
 }
 
+/// Titles a browser gives its picture-in-picture window, lowercase.
+///
+/// Wayland has no picture-in-picture protocol: a floating video window is an
+/// ordinary toplevel, so a compositor can only recognise it by rule. These are
+/// the titles Firefox and Chromium use, including the localisations Caelune
+/// ships for.
+const PICTURE_IN_PICTURE_TITLES: [&str; 6] = [
+    "picture-in-picture",
+    "picture in picture",
+    "imagem sobre imagem",
+    "picture-in-picture-modus",
+    "imagen en imagen",
+    "incrustation vidéo",
+];
+
+/// Whether a toplevel is a browser's floating video window.
+///
+/// Such a window is useless unless it stays above the windows the user is
+/// working in, which is the whole point of putting the video there.
+pub fn is_picture_in_picture(app_id: &str, title: &str) -> bool {
+    let title = title.trim().to_lowercase();
+    if title.is_empty() {
+        return false;
+    }
+    // The title alone is enough: an ordinary document window is not called
+    // "Picture-in-Picture", and matching the whole title rather than a
+    // substring keeps a browser tab named after the feature from floating.
+    if PICTURE_IN_PICTURE_TITLES.contains(&title.as_str()) {
+        return true;
+    }
+    // Chromium appends the site to its own window title.
+    let app_id = app_id.to_lowercase();
+    let browser = ["chromium", "chrome", "brave", "vivaldi", "firefox", "librewolf"]
+        .iter()
+        .any(|name| app_id.contains(name));
+    browser && PICTURE_IN_PICTURE_TITLES.iter().any(|known| title.starts_with(known))
+}
+
 fn clamp_origin_to_area(area: Rect, size: Size, position: Point) -> Point {
     let width = size.width.max(1);
     let height = size.height.max(1);
@@ -1521,6 +1559,45 @@ mod tests {
 
     fn active(manager: &WindowManager) -> WindowId {
         manager.active_window().expect("a window should be active")
+    }
+
+    #[test]
+    fn recognises_a_browser_floating_video_window() {
+        assert!(is_picture_in_picture("firefox", "Picture-in-Picture"));
+        assert!(is_picture_in_picture("org.mozilla.firefox", "picture-in-picture"));
+        assert!(is_picture_in_picture("chromium", "Picture in picture"));
+        assert!(is_picture_in_picture("firefox", "Imagem sobre imagem"));
+    }
+
+    #[test]
+    fn leaves_ordinary_windows_on_the_normal_layer() {
+        assert!(!is_picture_in_picture("firefox", "GitHub - Mozilla Firefox"));
+        assert!(!is_picture_in_picture("org.gnome.TextEditor", "notes.txt"));
+        assert!(!is_picture_in_picture("firefox", ""));
+        // A page that merely mentions the feature must not float the window.
+        assert!(!is_picture_in_picture(
+            "firefox",
+            "How to use picture in picture - YouTube"
+        ));
+    }
+
+    #[test]
+    fn floating_video_sits_above_a_normal_window() {
+        let mut manager = WindowManager::new(Rect::new(0, 0, 1366, 768));
+        let below = manager.create_window(Size::new(800, 600), SizeLimits::default());
+        let video = manager.create_window(Size::new(320, 180), SizeLimits::default());
+
+        assert!(manager.set_always_on_top(video, true));
+        // Focusing the lower window must not bury the floating video.
+        assert!(manager.focus(below));
+
+        let order: Vec<WindowId> = manager.windows().iter().map(Window::id).collect();
+        let video_index = order.iter().position(|id| *id == video).expect("video is stacked");
+        let below_index = order.iter().position(|id| *id == below).expect("window is stacked");
+        assert!(
+            video_index > below_index,
+            "the floating video must stay above the focused window"
+        );
     }
 
     #[test]

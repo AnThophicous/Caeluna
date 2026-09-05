@@ -363,6 +363,7 @@ impl NativeDrmBackend {
         handle: &LoopHandle<'_, T>,
         wake: Option<smithay::reexports::calloop::LoopSignal>,
         input: super::input::LibinputSeatHandle,
+        vblank_ping: Option<smithay::reexports::calloop::ping::Ping>,
     ) -> Result<(), NativeDrmError> {
         let (seat_notifier, drm_notifier, udev) = {
             let mut backend = runtime.borrow_mut();
@@ -409,6 +410,7 @@ impl NativeDrmBackend {
         let drm_wake = wake.clone();
         handle
             .insert_source(drm_notifier, move |event, _, _| {
+                let is_vblank = matches!(event, DrmEvent::VBlank(_));
                 let failed = if let Some(runtime) = weak_drm.upgrade() {
                     let mut backend = runtime.borrow_mut();
                     backend.on_drm_event(event);
@@ -416,6 +418,14 @@ impl NativeDrmBackend {
                 } else {
                     false
                 };
+                // A completed page-flip is the frame clock: ask the render
+                // loop for the next frame now, while the panel's timing is
+                // still the reference.
+                if is_vblank && !failed {
+                    if let Some(ping) = &vblank_ping {
+                        ping.ping();
+                    }
+                }
                 if let Some(wake) = &drm_wake {
                     if failed {
                         wake.stop();
@@ -543,6 +553,12 @@ impl NativeDrmBackend {
         pipeline
             .frame_submitted(crtc)
             .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+    }
+
+    /// The selected mode's exact refresh rate, in millihertz.
+    #[cfg(feature = "native-session")]
+    pub fn refresh_millihertz(&self) -> Option<u32> {
+        self.scanout.map(|config| mode_refresh_millihertz(&config.mode))
     }
 
     /// The selected connector's panel size in millimetres, from its EDID.
@@ -714,7 +730,11 @@ impl NativeDrmBackend {
                                 name: mode.name().to_string_lossy().into_owned(),
                                 width,
                                 height,
-                                refresh_millihertz: mode.vrefresh(),
+                                // `vrefresh` is whole hertz, not millihertz.
+                                #[cfg(feature = "native-session")]
+                                refresh_millihertz: mode_refresh_millihertz(mode),
+                                #[cfg(not(feature = "native-session"))]
+                                refresh_millihertz: mode.vrefresh().saturating_mul(1000),
                             }
                         })
                         .collect();
@@ -876,6 +896,133 @@ const OPEN_BACKOFF: Duration = Duration::from_millis(250);
 #[cfg(feature = "native-session")]
 const MAX_RENDER_FAILURES: u32 = 60;
 
+/// Everything the native frame loop carries between wake-ups.
+///
+/// It lives behind one `Rc<RefCell<_>>` because two event sources drive
+/// rendering: the page-flip completion, which is the real clock, and a timer
+/// that acts as the heartbeat when no flip is in flight.
+#[cfg(feature = "native-session")]
+struct NativeRenderLoop {
+    runtime: Rc<RefCell<NativeDrmBackend>>,
+    output_size: smithay::utils::Size<i32, smithay::utils::Physical>,
+    delivered_presentations: u64,
+    render_failures: u32,
+    last_recovery_attempt: Instant,
+    recovering_since: Option<Instant>,
+}
+
+/// Render one native frame if there is anything to show.
+///
+/// Called from the page-flip handler, so the next frame is prepared the moment
+/// the previous one reaches the panel rather than on a fixed timer that drifts
+/// against the panel's own rate. That drift is what a video sees as judder.
+#[cfg(feature = "native-session")]
+fn drive_native_frame(shared: &Rc<RefCell<NativeRenderLoop>>, state: &mut super::Rouch) {
+    let mut loop_state = shared.borrow_mut();
+    let runtime = Rc::clone(&loop_state.runtime);
+
+    // A Wayland frame callback means the compositor actually presented the
+    // previous buffer. Do not acknowledge a client commit merely because a
+    // page-flip request was queued.
+    let presented_frames = runtime.borrow().presented_frames();
+    if presented_frames > loop_state.delivered_presentations {
+        loop_state.delivered_presentations = presented_frames;
+        super::nested::complete_native_frame(state);
+    }
+
+    // A hotplug, a connector re-probe or a seat hand-off can drop the scanout
+    // pipeline. That is recoverable, so retry on a slow cadence instead of
+    // ending the session. The budget still bounds it: a GPU that never comes
+    // back exits rather than holding a black screen.
+    if runtime.borrow().status() == NativeDrmStatus::Active {
+        loop_state.recovering_since = None;
+    } else {
+        let now = Instant::now();
+        if now.duration_since(loop_state.last_recovery_attempt) >= RECOVERY_INTERVAL {
+            loop_state.last_recovery_attempt = now;
+            let recovered = runtime.borrow_mut().try_recover();
+            if recovered {
+                loop_state.recovering_since = None;
+                state.request_redraw();
+            } else if runtime.borrow().status() != NativeDrmStatus::Paused {
+                let since = *loop_state.recovering_since.get_or_insert(now);
+                if now.duration_since(since) >= RECOVERY_BUDGET {
+                    runtime.borrow_mut().mark_failure(NativeDrmError::new(
+                        NativeDrmErrorKind::Drm,
+                        "native scanout could not be restored within the recovery budget",
+                    ));
+                    state.loop_signal.stop();
+                }
+            }
+        }
+    }
+
+    if !runtime.borrow().can_render() || !state.redraw_needed() || state.output_blank() {
+        return;
+    }
+
+    if let Some((_, (width, height), _)) = runtime.borrow().scanout_config() {
+        let native_size = (i32::from(width), i32::from(height)).into();
+        if native_size != loop_state.output_size {
+            state.update_output_size(native_size);
+            loop_state.output_size = native_size;
+        }
+    }
+    let output_size = loop_state.output_size;
+
+    state.reconcile_nested_clients();
+    state.refresh_animations();
+    state.consume_redraw_request();
+
+    let result = {
+        let mut backend = runtime.borrow_mut();
+        backend.render_frame_with::<super::decorations::RouchRenderElements<
+            smithay::backend::renderer::gles::GlesRenderer,
+        >, _>([0.015, 0.035, 0.095, 1.0], |renderer| {
+            Ok(super::nested::build_render_elements(state, renderer, output_size))
+        })
+    };
+    match result {
+        // `false` is an idle desktop with nothing to repaint, not a failure:
+        // no buffer was queued and no vblank is coming.
+        Ok(_submitted) => loop_state.render_failures = 0,
+        Err(error) => {
+            warn!(?error, "Could not render native Rouch frame");
+            loop_state.render_failures += 1;
+            let mut backend = runtime.borrow_mut();
+            if loop_state.render_failures >= MAX_RENDER_FAILURES {
+                backend.mark_failure(error);
+                drop(backend);
+                state.loop_signal.stop();
+            } else {
+                // A single failed frame is not a dead GPU. Release the surface
+                // and let the recovery pass rebuild it.
+                backend.release_scanout_surface();
+                backend.mark_recovering(error);
+            }
+        }
+    }
+}
+
+/// One mode's exact refresh rate, in millihertz.
+///
+/// `Mode::vrefresh` is a rounded whole number, so a 59.94 Hz panel reports 60
+/// and a video player told that value computes the wrong cadence and drops or
+/// repeats a frame every few seconds. The pixel clock and the total blanking
+/// give the real figure.
+#[cfg(feature = "native-session")]
+fn mode_refresh_millihertz(mode: &Mode) -> u32 {
+    let (_, _, htotal) = mode.hsync();
+    let (_, _, vtotal) = mode.vsync();
+    let total = u64::from(htotal) * u64::from(vtotal);
+    if total == 0 {
+        return mode.vrefresh().saturating_mul(1000);
+    }
+    // `clock` is in kHz, so kHz * 1_000_000 / (htotal * vtotal) is millihertz.
+    u32::try_from(u64::from(mode.clock()) * 1_000_000 / total)
+        .unwrap_or_else(|_| mode.vrefresh().saturating_mul(1000))
+}
+
 /// Validate everything the Wayland side needs *before* any DRM master is taken.
 ///
 /// `NativeDrmBackend::open` creates the GBM/EGL scanout surface, and from that
@@ -1015,6 +1162,11 @@ pub(super) fn run_native(
             .physical_size_mm()
             .map(|(width, height)| (width as i32, height as i32).into())
             .unwrap_or_else(|| super::nested::physical_size_at_96_dpi(output_size)),
+        runtime
+            .borrow()
+            .refresh_millihertz()
+            .and_then(|refresh| i32::try_from(refresh).ok())
+            .unwrap_or(60_000),
     )
     .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
 
@@ -1040,11 +1192,17 @@ pub(super) fn run_native(
     let input_handle = input_source.handle();
     input_handle.session_event(smithay::backend::session::Event::ActivateSession);
 
+    // Woken by each completed page-flip, so the next frame is prepared against
+    // the panel's own timing rather than a timer that drifts against it.
+    let (vblank_ping, vblank_source) = smithay::reexports::calloop::ping::make_ping()
+        .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
+
     NativeDrmBackend::install_sources(
         &runtime,
         &event_loop.handle(),
         Some(state.loop_signal.clone()),
         input_handle.clone(),
+        Some(vblank_ping),
     )?;
     event_loop
         .handle()
@@ -1061,13 +1219,45 @@ pub(super) fn run_native(
         runtime.borrow_mut().change_vt(vt)?;
     }
 
-    let frame_runtime = Rc::clone(&runtime);
+    let render_loop = Rc::new(RefCell::new(NativeRenderLoop {
+        runtime: Rc::clone(&runtime),
+        output_size,
+        delivered_presentations: runtime.borrow().presented_frames(),
+        render_failures: 0,
+        last_recovery_attempt: Instant::now(),
+        recovering_since: None,
+    }));
+
+    // The page-flip completion is the real frame clock. Rendering from it
+    // instead of from a fixed timer is what keeps presentation locked to the
+    // panel: a 16 ms timer against a 59.94 Hz panel beats in and out of phase,
+    // which a video shows as periodic judder.
+    let ping_loop = Rc::clone(&render_loop);
+    event_loop
+        .handle()
+        .insert_source(vblank_source, move |_, _, state| {
+            drive_native_frame(&ping_loop, state);
+        })
+        .map_err(|error| {
+            NativeDrmError::new(
+                NativeDrmErrorKind::EventLoop,
+                format!("native vblank source: {error:?}"),
+            )
+        })?;
+
+    // The heartbeat covers everything the flip cannot: the first frame, an
+    // idle desktop waking on input, and a scanout that stopped producing
+    // flips at all. It runs at the panel's own rate so it never becomes the
+    // thing that paces presentation.
+    let heartbeat = Duration::from_micros(
+        runtime
+            .borrow()
+            .refresh_millihertz()
+            .filter(|refresh| *refresh > 0)
+            .map_or(16_667, |refresh| 1_000_000_000u64 / u64::from(refresh)),
+    );
     let repeat_input = input_handle.clone();
-    let mut current_output_size = output_size;
-    let mut delivered_presentations = runtime.borrow().presented_frames();
-    let mut last_recovery_attempt = Instant::now();
-    let mut recovering_since: Option<Instant> = None;
-    let mut render_failures: u32 = 0;
+    let timer_loop = Rc::clone(&render_loop);
     event_loop
         .handle()
         .insert_source(Timer::from_duration(Duration::ZERO), move |_, _, state| {
@@ -1089,89 +1279,8 @@ pub(super) fn run_native(
                 state.request_redraw();
             }
 
-            // A Wayland frame callback means that the compositor actually
-            // presented the previous buffer. Do not acknowledge a client
-            // commit merely because a page-flip request was queued.
-            let presented_frames = frame_runtime.borrow().presented_frames();
-            if presented_frames > delivered_presentations {
-                delivered_presentations = presented_frames;
-                super::nested::complete_native_frame(state);
-            }
-
-            // A hotplug, a connector re-probe or a seat hand-off can drop the
-            // scanout pipeline. That is recoverable, so retry on a slow cadence
-            // instead of ending the session. The budget still bounds it: a GPU
-            // that never comes back exits rather than holding a black screen.
-            if frame_runtime.borrow().status() == NativeDrmStatus::Active {
-                recovering_since = None;
-            } else {
-                let now = Instant::now();
-                if now.duration_since(last_recovery_attempt) >= RECOVERY_INTERVAL {
-                    last_recovery_attempt = now;
-                    let recovered = frame_runtime.borrow_mut().try_recover();
-                    if recovered {
-                        recovering_since = None;
-                        state.request_redraw();
-                    } else if frame_runtime.borrow().status() != NativeDrmStatus::Paused {
-                        let since = *recovering_since.get_or_insert(now);
-                        if now.duration_since(since) >= RECOVERY_BUDGET {
-                            frame_runtime.borrow_mut().mark_failure(NativeDrmError::new(
-                                NativeDrmErrorKind::Drm,
-                                "native scanout could not be restored within the recovery budget",
-                            ));
-                            state.loop_signal.stop();
-                        }
-                    }
-                }
-            }
-
-            let can_render = frame_runtime.borrow().can_render();
-            if can_render && state.redraw_needed() && !state.output_blank() {
-                if let Some((_, (width, height), _)) = frame_runtime.borrow().scanout_config() {
-                    let native_size = (i32::from(width), i32::from(height)).into();
-                    if native_size != current_output_size {
-                        state.update_output_size(native_size);
-                        current_output_size = native_size;
-                    }
-                }
-                state.reconcile_nested_clients();
-                state.refresh_animations();
-                state.consume_redraw_request();
-                let result = {
-                    let mut backend = frame_runtime.borrow_mut();
-                    backend.render_frame_with::<super::decorations::RouchRenderElements<
-                        smithay::backend::renderer::gles::GlesRenderer,
-                    >, _>([0.015, 0.035, 0.095, 1.0], |renderer| {
-                        Ok(super::nested::build_render_elements(
-                            state,
-                            renderer,
-                            current_output_size,
-                        ))
-                    })
-                };
-                match result {
-                    // `false` is an idle desktop with nothing to repaint, not
-                    // a failure: no buffer was queued and no vblank is coming.
-                    Ok(_submitted) => render_failures = 0,
-                    Err(error) => {
-                        warn!(?error, "Could not render native Rouch frame");
-                        render_failures += 1;
-                        let mut backend = frame_runtime.borrow_mut();
-                        if render_failures >= MAX_RENDER_FAILURES {
-                            backend.mark_failure(error);
-                            drop(backend);
-                            state.loop_signal.stop();
-                        } else {
-                            // A single failed frame is not a dead GPU. Release
-                            // the surface and let the recovery pass rebuild it.
-                            backend.release_scanout_surface();
-                            backend.mark_recovering(error);
-                        }
-                    }
-                }
-            }
-
-            TimeoutAction::ToDuration(Duration::from_millis(16))
+            drive_native_frame(&timer_loop, state);
+            TimeoutAction::ToDuration(heartbeat)
         })
         .map_err(|error| {
             NativeDrmError::new(
