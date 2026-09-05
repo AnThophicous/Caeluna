@@ -17,7 +17,10 @@ use smithay::{
         },
         drm::{DrmDevice, DrmDeviceFd, GbmBufferedSurface},
         egl::{EGLContext, EGLDisplay},
-        renderer::{Bind, Color32F, Frame, Renderer, element::RenderElement, gles::GlesRenderer},
+        renderer::{
+            Bind, Color32F, Frame, Renderer, damage::OutputDamageTracker, element::RenderElement,
+            gles::GlesRenderer,
+        },
     },
     reexports::drm::control::{Mode, connector, crtc},
     utils::{Physical, Rectangle, Scale, Size, Transform},
@@ -52,6 +55,13 @@ impl std::error::Error for NativePipelineError {}
 /// One physical output and its GBM/EGL/GLES scanout pipeline.
 pub(crate) struct NativeFramePipeline {
     renderer: GlesRenderer,
+    /// Tracks what actually changed between frames.
+    ///
+    /// Repainting the whole panel every 16 ms when nothing moved is the
+    /// cheapest cost to remove on low-power hardware: it is pure heat and
+    /// battery. The tracker also lets a frame with no damage be skipped
+    /// entirely, so an idle desktop stops queueing page-flips.
+    damage_tracker: OutputDamageTracker,
     gbm: GbmDevice<DrmDeviceFd>,
     surface: Option<BufferedSurface>,
     connector: connector::Handle,
@@ -117,14 +127,16 @@ impl NativeFramePipeline {
         .map_err(|error| NativePipelineError::new(format!("GBM scanout buffers: {error}")))?;
 
         let (width, height) = config.mode.size();
+        let size: Size<i32, Physical> = (width as i32, height as i32).into();
         Ok(Self {
             renderer,
+            damage_tracker: OutputDamageTracker::new(size, 1.0, Transform::Normal),
             gbm,
             surface: Some(buffered),
             connector: config.connector,
             crtc: config.crtc,
             mode: config.mode,
-            size: (width as i32, height as i32).into(),
+            size,
             queued_frames: 0,
             presented_frames: 0,
             frame_pending: false,
@@ -204,11 +216,15 @@ impl NativeFramePipeline {
     ///
     /// Scene construction must happen after the GBM framebuffer is bound so
     /// client buffers and compositor chrome use the exact same GLES context.
+    /// Render a frame, submitting only the region that actually changed.
+    ///
+    /// Returns `false` when nothing changed, in which case no buffer is queued
+    /// and the scanout keeps showing the frame already on screen.
     pub(crate) fn render_frame_with<E, F>(
         &mut self,
         clear_color: Color32F,
         build: F,
-    ) -> Result<(), NativePipelineError>
+    ) -> Result<bool, NativePipelineError>
     where
         E: RenderElement<GlesRenderer>,
         F: FnOnce(&mut GlesRenderer) -> Result<Vec<E>, String>,
@@ -222,49 +238,51 @@ impl NativeFramePipeline {
             .surface
             .as_mut()
             .ok_or_else(|| NativePipelineError::new("native scanout surface is paused"))?;
-        let (mut dmabuf, _buffer_age) = surface
+        let (mut dmabuf, buffer_age) = surface
             .next_buffer()
             .map_err(|error| NativePipelineError::new(format!("acquire GBM buffer: {error}")))?;
-        let full_damage = Rectangle::from_size(self.size);
-        let scale = Scale::from(1.0);
 
-        let sync = {
-            let mut framebuffer = self
-                .renderer
-                .bind(&mut dmabuf)
-                .map_err(|error| NativePipelineError::new(format!("bind GBM buffer: {error}")))?;
-            let elements = build(&mut self.renderer).map_err(NativePipelineError::new)?;
-            let mut frame = self
-                .renderer
-                .render(&mut framebuffer, self.size, Transform::Normal)
-                .map_err(|error| NativePipelineError::new(format!("begin GLES frame: {error}")))?;
-            frame
-                .clear(clear_color, &[full_damage])
-                .map_err(|error| NativePipelineError::new(format!("clear GLES frame: {error}")))?;
+        // `bind` ties the framebuffer's lifetime to the buffer, not to the
+        // renderer, so the renderer stays available for element construction
+        // and for the damage-tracked render pass.
+        let mut framebuffer = self
+            .renderer
+            .bind(&mut dmabuf)
+            .map_err(|error| NativePipelineError::new(format!("bind GBM buffer: {error}")))?;
+        let elements = build(&mut self.renderer).map_err(NativePipelineError::new)?;
 
-            for element in &elements {
-                element
-                    .draw(
-                        &mut frame,
-                        element.src(),
-                        element.geometry(scale),
-                        &[full_damage],
-                        &element.opaque_regions(scale),
-                    )
-                    .map_err(|error| NativePipelineError::new(format!("draw render element: {error}")))?;
-            }
+        let (sync, damage) = {
+            let result = self
+                .damage_tracker
+                .render_output(
+                    &mut self.renderer,
+                    &mut framebuffer,
+                    buffer_age as usize,
+                    &elements,
+                    clear_color,
+                )
+                .map_err(|error| NativePipelineError::new(format!("damage-tracked render: {error}")))?;
+            (result.sync, result.damage.cloned())
+        };
+        drop(framebuffer);
 
-            frame
-                .finish()
-                .map_err(|error| NativePipelineError::new(format!("finish GLES frame: {error}")))?
+        // `None` means the tracker found nothing to repaint. Queueing a
+        // page-flip anyway would burn a buffer and a vblank for an identical
+        // image, which is the whole cost this tracking exists to remove.
+        let Some(damage) = damage else {
+            return Ok(false);
         };
 
+        let surface = self
+            .surface
+            .as_mut()
+            .ok_or_else(|| NativePipelineError::new("native scanout surface is paused"))?;
         surface
-            .queue_buffer(Some(sync), Some(vec![full_damage]), ())
+            .queue_buffer(Some(sync), Some(damage), ())
             .map_err(|error| NativePipelineError::new(format!("queue DRM frame: {error}")))?;
         self.frame_pending = true;
         self.queued_frames = self.queued_frames.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
 
     /// Render and queue a frame.  The first queue performs the pending modeset;

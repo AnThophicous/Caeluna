@@ -483,11 +483,13 @@ impl NativeDrmBackend {
 
     /// Build and submit the scene while the native GLES renderer is bound.
     #[cfg(feature = "native-session")]
+    /// Render one native frame. `false` means nothing changed and no buffer
+    /// was queued, so the panel keeps showing the frame already on screen.
     pub fn render_frame_with<E, F>(
         &mut self,
         clear_color: impl Into<smithay::backend::renderer::Color32F>,
         build: F,
-    ) -> Result<(), NativeDrmError>
+    ) -> Result<bool, NativeDrmError>
     where
         E: smithay::backend::renderer::element::RenderElement<smithay::backend::renderer::gles::GlesRenderer>,
         F: FnOnce(&mut smithay::backend::renderer::gles::GlesRenderer) -> Result<Vec<E>, String>,
@@ -541,6 +543,18 @@ impl NativeDrmBackend {
         pipeline
             .frame_submitted(crtc)
             .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+    }
+
+    /// The selected connector's panel size in millimetres, from its EDID.
+    ///
+    /// Toolkits divide resolution by this to get a DPI. Reporting zero makes
+    /// them fall back to a guess, so text renders at the wrong size.
+    #[cfg(feature = "native-session")]
+    pub fn physical_size_mm(&self) -> Option<(u32, u32)> {
+        let config = self.scanout?;
+        let info = self.device.get_connector(config.connector, false).ok()?;
+        let (width, height) = info.size()?;
+        (width > 0 && height > 0).then_some((width, height))
     }
 
     /// The dmabuf formats the native renderer can import, for the Wayland
@@ -996,6 +1010,11 @@ pub(super) fn run_native(
         output_size,
         "rouch-native",
         smithay::utils::Transform::Normal,
+        runtime
+            .borrow()
+            .physical_size_mm()
+            .map(|(width, height)| (width as i32, height as i32).into())
+            .unwrap_or_else(|| super::nested::physical_size_at_96_dpi(output_size)),
     )
     .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
 
@@ -1131,7 +1150,9 @@ pub(super) fn run_native(
                     })
                 };
                 match result {
-                    Ok(()) => render_failures = 0,
+                    // `false` is an idle desktop with nothing to repaint, not
+                    // a failure: no buffer was queued and no vblank is coming.
+                    Ok(_submitted) => render_failures = 0,
                     Err(error) => {
                         warn!(?error, "Could not render native Rouch frame");
                         render_failures += 1;

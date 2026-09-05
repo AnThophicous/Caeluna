@@ -74,6 +74,16 @@ const DOUBLE_CLICK_MS: u128 = 400;
 /// exposed; duplicating a second grab state here would make grabs diverge.
 const MIN_HOST_SIZE: i32 = 1;
 
+/// The millimetre size a display of this pixel resolution would have at 96 DPI.
+///
+/// One inch is 25.4 mm, so a pixel at 96 DPI is 25.4/96 mm wide.
+pub(super) fn physical_size_at_96_dpi(
+    size: smithay::utils::Size<i32, Physical>,
+) -> smithay::utils::Size<i32, Physical> {
+    let millimetres = |pixels: i32| (f64::from(pixels) * 25.4 / 96.0).round() as i32;
+    (millimetres(size.w), millimetres(size.h)).into()
+}
+
 fn valid_host_size(size: smithay::utils::Size<i32, Physical>) -> bool {
     size.w >= MIN_HOST_SIZE && size.h >= MIN_HOST_SIZE
 }
@@ -141,6 +151,10 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
         output_size,
         "rouch-nested",
         smithay::utils::Transform::Flipped180,
+        // A nested window has no panel to measure, so report the size a 96 DPI
+        // display of this resolution would have. Zero would make every toolkit
+        // compute a DPI of zero.
+        physical_size_at_96_dpi(output_size),
     )?;
 
     install_winit_backend(&mut event_loop, &mut state, backend, winit)?;

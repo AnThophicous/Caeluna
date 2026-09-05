@@ -10,8 +10,9 @@ use std::{ffi::OsString, sync::Arc, time::Instant};
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
     delegate_alpha_modifier, delegate_compositor, delegate_data_device, delegate_dmabuf,
-    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_output, delegate_pointer_constraints, delegate_presentation,
+    delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_shm,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{Space, Window as DesktopWindow},
     input::{Seat, SeatHandler, SeatState},
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -30,6 +31,9 @@ use smithay::{
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint},
+        presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
         selection::{
             SelectionHandler,
             data_device::{
@@ -45,6 +49,10 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 use tracing::{debug, info, trace, warn};
@@ -163,16 +171,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// anyone can read it. This file appends and is the only trace that survives a
 /// failed login.
 fn session_log_path() -> std::path::PathBuf {
-    let state_home = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".local")
-                .join("state")
-        });
-    state_home.join("rouch").join("session.log")
+    state_home().join("rouch").join("session.log")
 }
 
 /// Append one timestamped line to the session log. Never fails the startup:
@@ -200,11 +199,22 @@ fn record_session_event(message: &str) {
 
 /// Where Rouch remembers the last-run version across sessions.
 fn state_path() -> std::path::PathBuf {
-    let home = std::env::var_os("XDG_STATE_HOME")
-        .or_else(|| std::env::var_os("HOME"))
+    state_home().join("rouch").join("version")
+}
+
+/// The XDG state directory, which is already a full path when the variable is
+/// set. Appending `.local/state` to it as well produced a path nothing ever
+/// read, so the desktop forgot its last version and replayed the welcome
+/// screen on every launch.
+fn state_home() -> std::path::PathBuf {
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+        return std::path::PathBuf::from(state_home);
+    }
+    std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".local").join("state").join("rouch").join("version")
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".local")
+        .join("state")
 }
 
 /// The resumable setup state lives beside the remembered release version.
@@ -526,6 +536,20 @@ pub struct Rouch {
     /// outright until the global exists.
     dmabuf_state: DmabufState,
     dmabuf_global: Option<DmabufGlobal>,
+    /// Pointer lock and confinement. Without it a first-person game cannot
+    /// capture the mouse, so the camera never turns.
+    _pointer_constraints_state: PointerConstraintsState,
+    /// Unaccelerated pointer deltas, which a locked pointer needs to be useful.
+    _relative_pointer_state: RelativePointerManagerState,
+    /// Lets an application ask for focus, so clicking a link in one program
+    /// actually raises the browser.
+    xdg_activation_state: XdgActivationState,
+    /// Real presentation timestamps. A video player uses these to schedule
+    /// frames; without them it guesses and drops or repeats frames.
+    _presentation_state: PresentationState,
+    /// Lets a client hand over a scaled/cropped buffer instead of
+    /// re-rendering, which is what makes a picture-in-picture window cheap.
+    _viewporter_state: ViewporterState,
     seat_state: SeatState<Rouch>,
     seat: Seat<Rouch>,
 
@@ -671,6 +695,7 @@ impl Rouch {
         output_size: Size<i32, Physical>,
         output_name: &str,
         output_transform: Transform,
+        physical_size_mm: Size<i32, smithay::utils::Physical>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
@@ -682,6 +707,14 @@ impl Rouch {
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&display_handle);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&display_handle);
+        // CLOCK_MONOTONIC is the clock every Wayland timestamp in this
+        // compositor already uses, so a client can compare them directly.
+        let presentation_state =
+            PresentationState::new::<Self>(&display_handle, libc::CLOCK_MONOTONIC as u32);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "rouch");
         seat.add_keyboard(Default::default(), 200, 25)?;
@@ -694,10 +727,14 @@ impl Rouch {
         let output = Output::new(
             output_name.to_owned(),
             PhysicalProperties {
-                size: (0, 0).into(),
+                // A zero physical size makes every toolkit compute a DPI of
+                // zero and fall back to a guess, so text lands at the wrong
+                // size. The caller passes the panel's real millimetres when
+                // the connector reports them.
+                size: physical_size_mm,
                 subpixel: Subpixel::Unknown,
-                make: "Rouch".into(),
-                model: "Rouch output".into(),
+                make: "Caelune".into(),
+                model: output_name.to_owned(),
             },
         );
         let _output_global = output.create_global::<Self>(&display_handle);
@@ -726,6 +763,11 @@ impl Rouch {
             // exists once a backend has built one. `enable_dmabuf` publishes it.
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
+            _pointer_constraints_state: pointer_constraints_state,
+            _relative_pointer_state: relative_pointer_state,
+            xdg_activation_state,
+            _presentation_state: presentation_state,
+            _viewporter_state: viewporter_state,
             seat_state,
             seat,
             windows: WindowManager::new(work_area_for(output_size)),
@@ -3369,6 +3411,83 @@ fn set_server_side_decoration(toplevel: &ToplevelSurface) {
     }
 }
 
+impl PointerConstraintsHandler for Rouch {
+    fn new_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+    ) {
+        // A constraint only becomes active while the surface actually holds
+        // the pointer. Activating one the user is not pointing at would trap
+        // the cursor in a window they cannot see.
+        let pointer_is_inside = pointer
+            .current_focus()
+            .is_some_and(|focus| focus == *surface);
+        if !pointer_is_inside {
+            return;
+        }
+        with_pointer_constraint(surface, pointer, |constraint| {
+            if let Some(constraint) = constraint {
+                constraint.activate();
+            }
+        });
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        location: smithay::utils::Point<f64, Logical>,
+    ) {
+        // The hint says where the cursor should reappear when the lock is
+        // released. It is only honoured for an active lock, so a background
+        // client cannot warp the pointer.
+        let active = with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|constraint| constraint.is_active())
+        });
+        if active {
+            debug!(?location, "Client set a cursor position hint for its locked pointer");
+        }
+    }
+}
+
+impl XdgActivationHandler for Rouch {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        // A token is single use: honouring it twice would let one click raise
+        // a window again later, at a moment the user did not ask for.
+        self.xdg_activation_state.remove_token(&token);
+
+        // Only a token minted from a real, recent user action may raise a
+        // window. Without this an idle background program could steal focus.
+        if token_data.timestamp.elapsed() > std::time::Duration::from_secs(10) {
+            debug!("Ignoring a stale xdg_activation token");
+            return;
+        }
+
+        let Some(id) = self
+            .xdg_windows
+            .iter()
+            .find(|window| *window.surface.wl_surface() == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        self.windows.focus(id);
+        self.reconfigure_windows();
+        self.request_redraw();
+        info!(window_id = id.raw(), "Raised a window through xdg_activation");
+    }
+}
+
 impl DmabufHandler for Rouch {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -3414,3 +3533,8 @@ delegate_data_device!(Rouch);
 delegate_primary_selection!(Rouch);
 delegate_xdg_decoration!(Rouch);
 delegate_dmabuf!(Rouch);
+delegate_pointer_constraints!(Rouch);
+delegate_relative_pointer!(Rouch);
+delegate_xdg_activation!(Rouch);
+delegate_presentation!(Rouch);
+delegate_viewporter!(Rouch);
