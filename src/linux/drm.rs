@@ -13,7 +13,14 @@
 //! frames use page-flip; no successful startup is reported before that frame
 //! pipeline is connected to the compositor loop.
 
-use std::{cell::RefCell, collections::HashSet, fmt, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    fmt,
+    path::PathBuf,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 #[cfg(feature = "native-session")]
 use smithay::reexports::drm::control::{Mode, ModeTypeFlags, crtc};
@@ -67,6 +74,19 @@ impl NativeDrmError {
             kind,
             detail: detail.into(),
         }
+    }
+
+    /// Whether a seat/VT hand-off can still resolve this failure.
+    ///
+    /// A display manager releases the previous session's seat asynchronously,
+    /// so the first probe after a login can legitimately find an inactive seat
+    /// or a connector that has not finished coming back.
+    #[cfg(feature = "native-session")]
+    fn is_transient(&self) -> bool {
+        matches!(
+            self.kind,
+            NativeDrmErrorKind::Seat | NativeDrmErrorKind::Drm | NativeDrmErrorKind::NoOutput
+        )
     }
 }
 
@@ -349,7 +369,7 @@ impl NativeDrmBackend {
             if backend.seat_notifier.is_none() || backend.drm_notifier.is_none() || backend.udev.is_none() {
                 return Err(NativeDrmError::new(
                     NativeDrmErrorKind::EventLoop,
-                    "one or more native sources are already installed",
+                    "the native seat, DRM and udev sources can only be installed once",
                 ));
             }
             (
@@ -559,18 +579,18 @@ impl NativeDrmBackend {
                     self.report.status = NativeDrmStatus::Recovering;
                     self.needs_reprobe = true;
                     if let Err(error) = self.reprobe(true) {
-                        self.mark_failure(error);
+                        self.mark_recovering(error);
                         return;
                     }
                     #[cfg(feature = "native-session")]
                     if let Err(error) = self.restore_scanout() {
-                        self.mark_failure(error);
+                        self.mark_recovering(error);
                         return;
                     }
                     info!(report = %self.report.summary(), "Native seat activated and DRM outputs re-probed");
                 }
                 Err(error) => {
-                    self.mark_failure(NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
+                    self.mark_recovering(NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
                 }
             },
         }
@@ -630,11 +650,11 @@ impl NativeDrmBackend {
                 "selected DRM node was removed; native session cannot safely continue",
             ));
         } else if let Err(error) = self.reprobe_if_needed() {
-            self.mark_failure(error);
+            self.mark_recovering(error);
         } else {
             #[cfg(feature = "native-session")]
             if let Err(error) = self.restore_scanout() {
-                self.mark_failure(error);
+                self.mark_recovering(error);
             }
         }
     }
@@ -696,6 +716,18 @@ impl NativeDrmBackend {
         Ok(())
     }
 
+    /// Drop the scanout surface so the next `restore_scanout` rebuilds it.
+    ///
+    /// `restore_scanout` reuses a pipeline whose connector/CRTC/mode is still
+    /// advertised, so a surface that renders but never presents would otherwise
+    /// be "restored" unchanged on every retry.
+    #[cfg(feature = "native-session")]
+    fn release_scanout_surface(&mut self) {
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.pause();
+        }
+    }
+
     #[cfg(feature = "native-session")]
     fn restore_scanout(&mut self) -> Result<(), NativeDrmError> {
         if !self.device.is_active() {
@@ -754,12 +786,158 @@ impl NativeDrmBackend {
         ))
     }
 
+    /// Record a scanout loss that a later probe can still undo.
+    ///
+    /// Hotplug, a connector re-probe and a seat hand-off all reach this path.
+    /// Marking them `Failed` stops the event loop, which the user sees as a
+    /// black screen followed by the display manager's login screen.
+    /// `Recovering` keeps the session alive so the frame timer can retry.
+    fn mark_recovering(&mut self, error: NativeDrmError) {
+        warn!(kind = %error.kind, detail = %error.detail, "Native scanout lost; scheduling a retry");
+        self.report.status = NativeDrmStatus::Recovering;
+        self.report.last_error = Some(error.to_string());
+        self.needs_reprobe = true;
+    }
+
+    /// Retry a recoverable scanout loss. `true` means scanout is active again.
+    #[cfg(feature = "native-session")]
+    pub fn try_recover(&mut self) -> bool {
+        match self.report.status {
+            NativeDrmStatus::Active => return true,
+            // `Paused` is a VT switch: the seat notifier owns that transition.
+            NativeDrmStatus::Failed | NativeDrmStatus::Paused => return false,
+            NativeDrmStatus::Recovering | NativeDrmStatus::NoOutputs => {}
+        }
+
+        if !self.device.is_active() {
+            if let Err(error) = self.device.activate(false) {
+                self.report.last_error = Some(error.to_string());
+                return false;
+            }
+            self.needs_reprobe = true;
+        }
+        if let Err(error) = self.reprobe_if_needed() {
+            self.report.last_error = Some(error.to_string());
+            return false;
+        }
+        match self.restore_scanout() {
+            Ok(()) => self.report.status == NativeDrmStatus::Active,
+            Err(error) => {
+                self.report.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
     fn mark_failure(&mut self, error: NativeDrmError) {
         warn!(kind = %error.kind, detail = %error.detail, "Native DRM adapter entered recovery state");
         self.report.status = NativeDrmStatus::Failed;
         self.report.last_error = Some(error.to_string());
         self.needs_reprobe = true;
     }
+}
+
+/// How often a lost native scanout is retried by the frame timer.
+#[cfg(feature = "native-session")]
+const RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a lost native scanout may stay unrecovered before the session ends.
+#[cfg(feature = "native-session")]
+const RECOVERY_BUDGET: Duration = Duration::from_secs(20);
+/// How many times a native startup is retried across a seat/VT hand-off.
+#[cfg(feature = "native-session")]
+const OPEN_ATTEMPTS: u32 = 4;
+/// Pause between native startup attempts.
+#[cfg(feature = "native-session")]
+const OPEN_BACKOFF: Duration = Duration::from_millis(250);
+/// Consecutive failed frames tolerated before the native session gives up.
+#[cfg(feature = "native-session")]
+const MAX_RENDER_FAILURES: u32 = 60;
+
+/// Validate everything the Wayland side needs *before* any DRM master is taken.
+///
+/// `NativeDrmBackend::open` creates the GBM/EGL scanout surface, and from that
+/// moment the display manager's framebuffer is gone. Every failure after that
+/// point is invisible: the screen is already black and the display manager only
+/// observes the process exit, so a missing `XDG_RUNTIME_DIR` and a dead GPU look
+/// identical to the user. Running these checks first keeps a recoverable failure
+/// on the greeter, where its message can still be read.
+#[cfg(feature = "native-session")]
+fn preflight(environment: &SessionEnvironment) -> Result<(), NativeDrmError> {
+    let Some(runtime_dir) = environment.runtime_dir.as_ref() else {
+        return Err(NativeDrmError::new(
+            NativeDrmErrorKind::NotReady,
+            "XDG_RUNTIME_DIR is not set, so the Wayland socket cannot be created; \
+             start the session from a display manager or a logind session",
+        ));
+    };
+    if !runtime_dir.is_dir() {
+        return Err(NativeDrmError::new(
+            NativeDrmErrorKind::NotReady,
+            format!(
+                "XDG_RUNTIME_DIR={} is not an existing directory",
+                runtime_dir.display()
+            ),
+        ));
+    }
+
+    // The socket is created by `ListeningSocketSource::new_auto` much later,
+    // after DRM master has been taken. Proving the directory is writable now
+    // turns that late failure into an early, visible one.
+    let probe = runtime_dir.join(".rouch-session-preflight");
+    std::fs::write(&probe, b"").map_err(|error| {
+        NativeDrmError::new(
+            NativeDrmErrorKind::NotReady,
+            format!(
+                "XDG_RUNTIME_DIR={} is not writable: {error}",
+                runtime_dir.display()
+            ),
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+
+    if (0..32).all(|index| runtime_dir.join(format!("wayland-{index}")).exists()) {
+        return Err(NativeDrmError::new(
+            NativeDrmErrorKind::NotReady,
+            format!(
+                "no free Wayland socket name in {}; wayland-0 through wayland-31 are all taken",
+                runtime_dir.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Open the seat and DRM node, retrying while the display manager finishes
+/// handing over the VT.
+#[cfg(feature = "native-session")]
+fn open_with_retry(
+    options: &SessionOptions,
+    environment: &SessionEnvironment,
+) -> Result<NativeDrmBackend, NativeDrmError> {
+    let mut last_error = None;
+    for attempt in 1..=OPEN_ATTEMPTS {
+        match NativeDrmBackend::open(options, environment) {
+            Ok(backend) => return Ok(backend),
+            Err(error) if attempt < OPEN_ATTEMPTS && error.is_transient() => {
+                warn!(
+                    attempt,
+                    kind = %error.kind,
+                    detail = %error.detail,
+                    "Native startup was not ready yet; retrying after the seat hand-off"
+                );
+                last_error = Some(error);
+                std::thread::sleep(OPEN_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        NativeDrmError::new(
+            NativeDrmErrorKind::NotReady,
+            "native startup did not complete within the retry budget",
+        )
+    }))
 }
 
 /// Run a complete native session: acquire the seat and DRM node, create a
@@ -783,10 +961,13 @@ pub(super) fn run_native(
 ) -> Result<(), NativeDrmError> {
     let mut event_loop: EventLoop<super::Rouch> = EventLoop::try_new()
         .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
+    // Everything that does not need DRM master is checked while the display
+    // manager still owns the screen, so a failure is readable instead of black.
+    preflight(environment)?;
     // Declare the event loop first. Rust drops locals in reverse declaration
     // order, so the runtime/device is released before the event-source
     // notifiers release the strong libseat session on every error path.
-    let runtime = Rc::new(RefCell::new(NativeDrmBackend::open(options, environment)?));
+    let runtime = Rc::new(RefCell::new(open_with_retry(options, environment)?));
 
     let output_size = runtime
         .borrow()
@@ -846,6 +1027,9 @@ pub(super) fn run_native(
     let repeat_input = input_handle.clone();
     let mut current_output_size = output_size;
     let mut delivered_presentations = runtime.borrow().presented_frames();
+    let mut last_recovery_attempt = Instant::now();
+    let mut recovering_since: Option<Instant> = None;
+    let mut render_failures: u32 = 0;
     event_loop
         .handle()
         .insert_source(Timer::from_duration(Duration::ZERO), move |_, _, state| {
@@ -876,6 +1060,33 @@ pub(super) fn run_native(
                 super::nested::complete_native_frame(state);
             }
 
+            // A hotplug, a connector re-probe or a seat hand-off can drop the
+            // scanout pipeline. That is recoverable, so retry on a slow cadence
+            // instead of ending the session. The budget still bounds it: a GPU
+            // that never comes back exits rather than holding a black screen.
+            if frame_runtime.borrow().status() == NativeDrmStatus::Active {
+                recovering_since = None;
+            } else {
+                let now = Instant::now();
+                if now.duration_since(last_recovery_attempt) >= RECOVERY_INTERVAL {
+                    last_recovery_attempt = now;
+                    let recovered = frame_runtime.borrow_mut().try_recover();
+                    if recovered {
+                        recovering_since = None;
+                        state.request_redraw();
+                    } else if frame_runtime.borrow().status() != NativeDrmStatus::Paused {
+                        let since = *recovering_since.get_or_insert(now);
+                        if now.duration_since(since) >= RECOVERY_BUDGET {
+                            frame_runtime.borrow_mut().mark_failure(NativeDrmError::new(
+                                NativeDrmErrorKind::Drm,
+                                "native scanout could not be restored within the recovery budget",
+                            ));
+                            state.loop_signal.stop();
+                        }
+                    }
+                }
+            }
+
             let can_render = frame_runtime.borrow().can_render();
             if can_render && state.redraw_needed() && !state.output_blank() {
                 if let Some((_, (width, height), _)) = frame_runtime.borrow().scanout_config() {
@@ -901,11 +1112,21 @@ pub(super) fn run_native(
                     })
                 };
                 match result {
-                    Ok(()) => {}
+                    Ok(()) => render_failures = 0,
                     Err(error) => {
                         warn!(?error, "Could not render native Rouch frame");
-                        frame_runtime.borrow_mut().mark_failure(error);
-                        state.loop_signal.stop();
+                        render_failures += 1;
+                        let mut backend = frame_runtime.borrow_mut();
+                        if render_failures >= MAX_RENDER_FAILURES {
+                            backend.mark_failure(error);
+                            drop(backend);
+                            state.loop_signal.stop();
+                        } else {
+                            // A single failed frame is not a dead GPU. Release
+                            // the surface and let the recovery pass rebuild it.
+                            backend.release_scanout_surface();
+                            backend.mark_recovering(error);
+                        }
                     }
                 }
             }

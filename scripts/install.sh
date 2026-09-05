@@ -875,6 +875,70 @@ repair_gpu_driver() {
     esac
 }
 
+configure_seat_access() {
+    # libseat prefers logind and falls back to seatd. Installing the seatd
+    # package is not enough: the socket has to be running and the account has
+    # to be in the seat group. Without a usable seat the compositor cannot take
+    # DRM master, and the display manager just returns to the login screen.
+    local -a wanted_groups=(seat video input render)
+    local -a missing_groups=()
+    local group
+    local seatd_unit=""
+    local enable_seatd=0
+
+    if ! has_command usermod || ! has_command getent || ! has_command id; then
+        warn "usermod/getent/id não estão disponíveis; a checagem de seat foi ignorada"
+        return 0
+    fi
+
+    for group in "${wanted_groups[@]}"; do
+        getent group "$group" >/dev/null 2>&1 || continue
+        if id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$group"; then
+            continue
+        fi
+        missing_groups+=("$group")
+    done
+
+    if has_command systemctl; then
+        for candidate in /usr/lib/systemd/system/seatd.service /lib/systemd/system/seatd.service; do
+            [[ -e "$candidate" ]] || continue
+            seatd_unit="$candidate"
+            break
+        done
+        if [[ -n "$seatd_unit" ]] && ! systemctl is-enabled --quiet seatd 2>/dev/null; then
+            enable_seatd=1
+        fi
+    fi
+
+    if ((${#missing_groups[@]} == 0 && !enable_seatd)); then
+        success "acesso a seat/DRM já está configurado para $TARGET_USER"
+        return 0
+    fi
+
+    if ((${#missing_groups[@]} > 0)); then
+        info "grupos que faltam para $TARGET_USER: ${missing_groups[*]}"
+    fi
+    if ((enable_seatd)); then
+        info "seatd está instalado mas não está ativo; ele é o fallback quando o logind não atende"
+    fi
+    confirm "Configurar o acesso a seat/DRM (grupos e seatd) para $TARGET_USER?"
+
+    for group in "${missing_groups[@]}"; do
+        if ! run_privileged usermod -aG "$group" "$TARGET_USER"; then
+            warn "não foi possível adicionar $TARGET_USER ao grupo $group"
+        fi
+    done
+    if ((enable_seatd)); then
+        if ! run_privileged systemctl enable --now seatd; then
+            warn "não foi possível ativar o seatd; o logind continua sendo o caminho principal"
+        fi
+    fi
+    if ((${#missing_groups[@]} > 0)); then
+        info "os novos grupos só valem depois de sair e entrar de novo na sessão"
+    fi
+    success "acesso a seat/DRM configurado para $TARGET_USER"
+}
+
 configure_flatpak() {
     local remotes
 
@@ -1306,6 +1370,18 @@ write_launcher() {
             printf '%s\n' 'export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"'
         fi
         if [[ "$mode" == session ]]; then
+            # The display manager truncates its own session log on every
+            # attempt and returns to the greeter immediately, so a failed login
+            # otherwise leaves no readable trace. Append to a durable log.
+            printf '%s\n' 'log_file=""'
+            printf '%s\n' 'state_dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/rouch"'
+            printf '%s\n' 'if mkdir -p "$state_dir" 2>/dev/null && : >> "$state_dir/session.log" 2>/dev/null; then'
+            printf '%s\n' '    log_file="$state_dir/session.log"'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if [ -n "$log_file" ]; then'
+            printf '%s\n' '    printf "\\n=== %s: Caelune session start ===\\n" "$(date 2>/dev/null || printf "unknown time")" >> "$log_file" 2>/dev/null || true'
+            printf '%s\n' '    exec "$binary" --session --no-fallback "$@" >> "$log_file" 2>&1'
+            printf '%s\n' 'fi'
             printf '%s\n' 'exec "$binary" --session --no-fallback "$@"'
         else
             printf '%s\n' "exec \"\$binary\" --$mode \"\$@\""
@@ -1792,6 +1868,7 @@ main() {
     write_desktop_entry
     activate_files
     configure_user_defaults
+    configure_seat_access
     configure_flatpak
     success "Caelune instalado com sucesso"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then

@@ -90,6 +90,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fallback_nested = options.fallback_nested,
         readiness = %environment.native_readiness(),
         xdg = %environment.diagnostic(),
+        log = ?session_log_path(),
         "Rouch startup policy"
     );
     let compatibility = compat::CapabilityMatrix::detect();
@@ -107,9 +108,20 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match crate::session::startup_plan(&options) {
         crate::session::StartupPlan::RunNested => nested::run(),
         crate::session::StartupPlan::TryNative { fallback_nested } => {
+            record_session_event(&format!(
+                "native start: readiness={}, {}",
+                environment.native_readiness(),
+                environment.diagnostic()
+            ));
             match drm::run_native(&options, &environment) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    record_session_event("native session ended normally");
+                    Ok(())
+                }
                 Err(error) if fallback_nested => {
+                    record_session_event(&format!(
+                        "native session unavailable ({error}); falling back to nested"
+                    ));
                     tracing::warn!(
                         kind = %error.kind,
                         detail = %error.detail,
@@ -117,9 +129,54 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     );
                     nested::run()
                 }
-                Err(error) => Err(Box::new(error)),
+                Err(error) => {
+                    record_session_event(&format!("native session failed: {error}"));
+                    Err(Box::new(error))
+                }
             }
         }
+    }
+}
+
+/// Where a native session records why it started and why it stopped.
+///
+/// A display manager restarts its greeter the moment the compositor exits, and
+/// it truncates its own session log on every attempt, so stderr is gone before
+/// anyone can read it. This file appends and is the only trace that survives a
+/// failed login.
+fn session_log_path() -> std::path::PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".local")
+                .join("state")
+        });
+    state_home.join("rouch").join("session.log")
+}
+
+/// Append one timestamped line to the session log. Never fails the startup:
+/// an unwritable state directory must not be the reason a session does not run.
+fn record_session_event(message: &str) {
+    use std::io::Write as _;
+
+    let path = session_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "[{seconds}] {message}"));
+    if let Err(error) = written {
+        warn!(path = ?path, ?error, "Could not append to the Rouch session log");
     }
 }
 

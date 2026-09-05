@@ -3,6 +3,10 @@
 #
 # The display-manager entry is a real native session. If DRM/KMS cannot be
 # acquired, fail visibly instead of opening a nested development window.
+#
+# Output is appended to a durable log. A display manager truncates its own
+# session log on every attempt and returns to the greeter immediately, so
+# without this file a failed login leaves no readable trace of the cause.
 set -eu
 
 binary=${ROUCH_BIN:-/usr/bin/rouch}
@@ -18,4 +22,16 @@ export ROUCH_LAUNCH_MODE=session
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-Rouch}"
 export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-Rouch}"
 export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+
+log_file=""
+state_dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/rouch"
+if mkdir -p "$state_dir" 2>/dev/null && : >> "$state_dir/session.log" 2>/dev/null; then
+    log_file="$state_dir/session.log"
+fi
+
+if [ -n "$log_file" ]; then
+    printf '\n=== %s: Rouch session start ===\n' "$(date 2>/dev/null || printf 'unknown time')" \
+        >> "$log_file" 2>/dev/null || true
+    exec "$binary" --session --no-fallback "$@" >> "$log_file" 2>&1
+fi
 exec "$binary" --session --no-fallback "$@"
