@@ -245,6 +245,40 @@ fn read_config_bool(key: &str, default: bool) -> bool {
     }
 }
 
+/// The video-acceleration environment the installer detected for this machine.
+///
+/// Read once and cached: it is a handful of `KEY=VALUE` lines describing which
+/// VA-API driver the installed GPU needs. Anything malformed is skipped rather
+/// than failing a launch, and an absent file simply means libva's own
+/// PCI-id detection is correct for this hardware.
+fn video_environment() -> &'static [(String, String)] {
+    static VIDEO_ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+    VIDEO_ENV.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = home.join(".config").join("rouch").join("video.env");
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+
+        let pairs: Vec<(String, String)> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+            // A key with an `=` or a NUL cannot be passed to execve.
+            .filter(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_graphic() && c != '='))
+            .collect();
+        if !pairs.is_empty() {
+            info!(count = pairs.len(), path = ?path, "Loaded the video acceleration environment");
+        }
+        pairs
+    })
+}
+
 /// Restore notification delivery preferences before the first client maps.
 fn notification_center_from_config() -> crate::notifications::NotificationCenter {
     let mut preferences = crate::notifications::NotificationPreferences::default();
@@ -1377,6 +1411,14 @@ impl Rouch {
         // that is not ours. Until XWayland is bridged, leaving it set makes a
         // toolkit prefer a server it cannot reach.
         command.env_remove("DISPLAY");
+
+        // Hardware video decode. libva resolves Intel and AMD from the PCI id,
+        // but NVIDIA's VA-API support is a bridge onto NVDEC and has to be
+        // named. The installer detects the hardware once and writes the result
+        // here, so the compositor never has to probe a GPU at startup.
+        for (key, value) in video_environment() {
+            command.env(key, value);
+        }
     }
 
     // ----- Finder --------------------------------------------------------

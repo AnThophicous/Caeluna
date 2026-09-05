@@ -961,8 +961,29 @@ pub struct GameModeEffects {
     pub pause_widget_refresh: bool,
     /// Pause App Gallery/Flatpak catalogue refreshes.
     pub pause_gallery_refresh: bool,
-    /// Optional redraw cap for shell surfaces; `None` keeps the current cap.
+    /// Optional redraw cap for **shell chrome only**; `None` keeps the current
+    /// cap.
+    ///
+    /// This must never reach the foreground game's own presentation. Capping
+    /// the compositor's frame loop caps the game with it, which is the exact
+    /// opposite of what Game Mode is for.
     pub redraw_cap_fps: Option<u16>,
+    /// Scan the foreground fullscreen surface out directly, skipping
+    /// composition of everything beneath it.
+    ///
+    /// This is the largest single gain available to a game: no blend pass, no
+    /// intermediate buffer, no copy. It is only safe while one opaque
+    /// fullscreen surface covers the whole output.
+    pub unredirect_fullscreen: bool,
+    /// Raise the foreground game's scheduling priority relative to background
+    /// work. Never lowers any other process below its own default.
+    pub foreground_priority: bool,
+    /// Keep the machine on its performance profile instead of the battery
+    /// profile while a game holds the foreground.
+    ///
+    /// A game is exactly when a user does not want the frame rate traded for
+    /// runtime, so Game Mode must not turn the battery profile on.
+    pub prefer_performance: bool,
     /// Stop optional shell animations while the game owns the foreground.
     pub limit_animations: bool,
     /// Hold noncritical notifications until the game ends.
@@ -982,6 +1003,9 @@ impl GameModeEffects {
                 redraw_cap_fps: Some(60),
                 limit_animations: true,
                 defer_noncritical_notifications: true,
+                unredirect_fullscreen: true,
+                foreground_priority: true,
+                prefer_performance: true,
             },
             PerformanceTier::Balanced => Self {
                 reduce_blur: true,
@@ -992,6 +1016,9 @@ impl GameModeEffects {
                 redraw_cap_fps: Some(45),
                 limit_animations: true,
                 defer_noncritical_notifications: true,
+                unredirect_fullscreen: true,
+                foreground_priority: true,
+                prefer_performance: true,
             },
             PerformanceTier::LowEnd => Self {
                 reduce_blur: true,
@@ -1002,6 +1029,11 @@ impl GameModeEffects {
                 redraw_cap_fps: Some(30),
                 limit_animations: true,
                 defer_noncritical_notifications: true,
+                // Low-end hardware is where skipping the blend pass matters
+                // most, not least.
+                unredirect_fullscreen: true,
+                foreground_priority: true,
+                prefer_performance: true,
             },
         }
     }
@@ -1080,7 +1112,10 @@ impl GameModePolicy {
     /// Apply only the permitted shell reductions to a typed shell snapshot.
     pub fn apply_to(self, before: ShellState) -> ShellState {
         let mut after = before;
-        after.battery_saver = true;
+        // Game Mode trades shell work for frame rate; it must not trade frame
+        // rate for runtime. Forcing the battery profile on while a game is in
+        // the foreground caps exactly what the user asked to protect.
+        after.battery_saver = before.battery_saver && !self.effects.prefer_performance;
         if self.effects.reduce_blur {
             after.blur_enabled = false;
         }
@@ -1658,6 +1693,60 @@ mod tests {
         assert_eq!(reduced.redraw_fps, 30);
         assert!(!reduced.animations_enabled);
         assert!(!reduced.noncritical_notifications_enabled);
+    }
+
+    #[test]
+    fn game_mode_never_forces_the_battery_profile_on() {
+        // Capping the frame rate to save power is the opposite of what a user
+        // asks for by launching a game.
+        let policy = GameModePolicy::for_tier(PerformanceTier::LowEnd);
+        let on_ac = ShellState {
+            battery_saver: false,
+            ..ShellState::default()
+        };
+        assert!(!policy.apply_to(on_ac).battery_saver);
+    }
+
+    #[test]
+    fn game_mode_keeps_an_explicit_battery_saver_choice() {
+        let policy = GameModePolicy::for_tier(PerformanceTier::LowEnd);
+        let mut saving = ShellState {
+            battery_saver: true,
+            ..ShellState::default()
+        };
+        // With the performance preference off, the user's own choice stands.
+        let mut effects = policy.effects;
+        effects.prefer_performance = false;
+        let policy = GameModePolicy {
+            effects,
+            ..GameModePolicy::for_tier(PerformanceTier::LowEnd)
+        };
+        saving = policy.apply_to(saving);
+        assert!(saving.battery_saver);
+    }
+
+    #[test]
+    fn every_tier_skips_composition_for_a_fullscreen_game() {
+        for tier in [
+            PerformanceTier::LowEnd,
+            PerformanceTier::Balanced,
+            PerformanceTier::HighEnd,
+        ] {
+            let effects = GameModeEffects::for_tier(tier);
+            assert!(effects.unredirect_fullscreen, "{tier:?} must skip the blend pass");
+            assert!(effects.foreground_priority, "{tier:?} must favour the game");
+        }
+    }
+
+    #[test]
+    fn the_redraw_cap_is_shell_chrome_only_and_never_raises_it() {
+        // A host already running below the cap must not be pushed up to it.
+        let policy = GameModePolicy::for_tier(PerformanceTier::HighEnd);
+        let slow = ShellState {
+            redraw_fps: 30,
+            ..ShellState::default()
+        };
+        assert_eq!(policy.apply_to(slow).redraw_fps, 30);
     }
 
     #[test]

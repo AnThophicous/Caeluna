@@ -58,9 +58,13 @@ HOST_CPU_THREADS=1
 HOST_MEMORY_MIB=0
 HOST_GPU_INFO="unavailable"
 GPU_VENDOR="unknown"
+# Space-separated: a hybrid machine reports every vendor it carries.
+GPU_VENDORS="unknown"
+CPU_VENDOR="unknown"
 GPU_MODEL="unknown"
 GPU_DRIVER="unknown"
 GPU_DRIVER_STATUS="unknown"
+VIDEO_ACCELERATION_STATUS="unknown"
 VULKAN_STATUS="unknown"
 OPENGL_STATUS="unknown"
 SESSION_STATUS="unknown"
@@ -330,6 +334,77 @@ run_file() {
     fi
 }
 
+# Whether a command has to be dropped to the target account.
+#
+# Files under the user's home, Flatpak's --user installation and the VA-API
+# probe all have to run as the person who will use the desktop. When the
+# installer itself is already that person, no wrapper is needed.
+target_needs_drop() {
+    ((EUID == 0)) && [[ -n "$TARGET_USER" && "$TARGET_USER" != root ]]
+}
+
+target_drop_prefix() {
+    if has_command runuser; then
+        printf 'runuser\n-u\n%s\n--\n' "$TARGET_USER"
+    elif has_command sudo; then
+        printf 'sudo\n-u\n%s\n--\n' "$TARGET_USER"
+    fi
+}
+
+# Run one command as the target account, echoing it and honouring --dry-run.
+run_target() {
+    local -a prefix=()
+    if target_needs_drop; then
+        mapfile -t prefix < <(target_drop_prefix)
+        if ((${#prefix[@]} == 0)); then
+            die "não há runuser nem sudo para executar como $TARGET_USER"
+        fi
+    fi
+    run "${prefix[@]}" "$@"
+}
+
+# Capturing variant: the caller reads stdout to make a decision, so the command
+# is neither echoed nor skipped by --dry-run.
+run_as_target() {
+    local -a prefix=()
+    if target_needs_drop; then
+        mapfile -t prefix < <(target_drop_prefix)
+        if ((${#prefix[@]} == 0)); then
+            return 1
+        fi
+    fi
+    "${prefix[@]}" "$@"
+}
+
+# A confirmation for a step the install can proceed without.
+#
+# `confirm` aborts the whole run on "no", which is right for "replace this
+# file?" and wrong for "also install this optional driver?": declining an
+# extra should not throw away an otherwise complete installation.
+confirm_optional() {
+    local prompt="$1"
+    local answer
+
+    if ((DRY_RUN)); then
+        return 0
+    fi
+    if ((ASSUME_YES)); then
+        return 0
+    fi
+    if [[ ! -r /dev/tty ]]; then
+        warn "$prompt; sem terminal para perguntar, etapa opcional ignorada"
+        return 1
+    fi
+    printf '%s [y/N] ' "$prompt" >/dev/tty
+    if ! read -r answer </dev/tty; then
+        return 1
+    fi
+    case "$answer" in
+        y|Y|yes|YES|Yes|s|S|sim|SIM|Sim) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 confirm() {
     local prompt="$1"
     local answer
@@ -483,6 +558,8 @@ detect_hardware() {
 
     HOST_GPU_INFO="unavailable"
     GPU_VENDOR="unknown"
+    GPU_VENDORS="unknown"
+    CPU_VENDOR="unknown"
     GPU_MODEL="unavailable"
     GPU_DRIVER="unavailable"
     GPU_DRIVER_STATUS="unknown"
@@ -508,33 +585,58 @@ detect_hardware() {
 
     if has_command lspci; then
         HOST_GPU_INFO="$(lspci -nn 2>/dev/null | awk '/VGA compatible controller|3D controller|Display controller/ { printf "%s%s", separator, $0; separator="; " }' || true)"
-        GPU_DRIVER="$(lspci -k 2>/dev/null | sed -n 's/^[[:space:]]*Kernel driver in use:[[:space:]]*//p' | head -n 1 || true)"
+        # The kernel driver must be read from the display device's own block.
+        # Taking the first "Kernel driver in use" in the whole listing reports
+        # whatever sits earliest on the bus, which is usually not a GPU.
+        GPU_DRIVER="$(lspci -k 2>/dev/null | awk '
+            /VGA compatible controller|3D controller|Display controller/ { in_gpu = 1; next }
+            in_gpu && /Kernel driver in use:/ {
+                sub(/^.*Kernel driver in use:[[:space:]]*/, "")
+                print
+                exit
+            }
+            /^[0-9a-f][0-9a-f]:/ { in_gpu = 0 }
+        ' || true)"
     fi
     [[ -n "$HOST_GPU_INFO" ]] || HOST_GPU_INFO="unavailable"
     [[ -n "$GPU_DRIVER" ]] || GPU_DRIVER="unavailable"
 
     gpu_lower="$(printf '%s' "$HOST_GPU_INFO" | tr '[:upper:]' '[:lower:]')"
+
+    # A machine can hold more than one GPU: a hybrid laptop has Intel or AMD
+    # integrated graphics next to an NVIDIA or AMD discrete card, and both need
+    # their driver and video-decode stack. Collect every vendor present rather
+    # than letting the first pattern win.
+    GPU_VENDORS=""
+    case "$gpu_lower" in *nvidia*) GPU_VENDORS="$GPU_VENDORS nvidia" ;; esac
     case "$gpu_lower" in
-        *nvidia*)
-            GPU_VENDOR="nvidia"
-            GPU_MODEL="$HOST_GPU_INFO"
-            ;;
-        *amd*|*ati*|*advanced\ micro\ devices*)
-            GPU_VENDOR="amd"
-            GPU_MODEL="$HOST_GPU_INFO"
-            ;;
-        *intel*)
-            GPU_VENDOR="intel"
-            GPU_MODEL="$HOST_GPU_INFO"
-            ;;
-        *virtio*|*vmware*|*virtualbox*|*qxl*|*bochs*)
-            GPU_VENDOR="virtual"
-            GPU_MODEL="$HOST_GPU_INFO"
-            ;;
-        *)
-            GPU_VENDOR="unknown"
-            GPU_MODEL="$HOST_GPU_INFO"
-            ;;
+        *amd*|*ati*|*advanced\ micro\ devices*|*radeon*) GPU_VENDORS="$GPU_VENDORS amd" ;;
+    esac
+    case "$gpu_lower" in *intel*) GPU_VENDORS="$GPU_VENDORS intel" ;; esac
+    case "$gpu_lower" in
+        *virtio*|*vmware*|*virtualbox*|*qxl*|*bochs*|*cirrus*) GPU_VENDORS="$GPU_VENDORS virtual" ;;
+    esac
+    GPU_VENDORS="${GPU_VENDORS# }"
+    [[ -n "$GPU_VENDORS" ]] || GPU_VENDORS="unknown"
+
+    # The primary vendor drives reporting and the driver-repair prompt. A
+    # discrete card is reported ahead of integrated graphics because it is the
+    # one whose driver is most often missing.
+    case " $GPU_VENDORS " in
+        *" nvidia "*) GPU_VENDOR="nvidia" ;;
+        *" amd "*) GPU_VENDOR="amd" ;;
+        *" intel "*) GPU_VENDOR="intel" ;;
+        *" virtual "*) GPU_VENDOR="virtual" ;;
+        *) GPU_VENDOR="unknown" ;;
+    esac
+    GPU_MODEL="$HOST_GPU_INFO"
+
+    # CPU vendor is independent of the GPU: an AMD CPU with an NVIDIA card and
+    # an Intel CPU with an AMD card are both ordinary machines.
+    case "$(printf '%s' "$HOST_CPU_MODEL" | tr '[:upper:]' '[:lower:]')" in
+        *amd*|*ryzen*|*epyc*|*athlon*) CPU_VENDOR="amd" ;;
+        *intel*|*celeron*|*pentium*|*xeon*|*core?i*) CPU_VENDOR="intel" ;;
+        *) CPU_VENDOR="unknown" ;;
     esac
 
     if [[ "$GPU_VENDOR" == nvidia ]] && has_command nvidia-smi &&
@@ -613,6 +715,116 @@ append_package() {
     esac
 }
 
+package_exists() {
+    local package="$1"
+    case "$PACKAGE_MANAGER" in
+        apt) apt-cache show "$package" >/dev/null 2>&1 ;;
+        pacman) pacman -Si "$package" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Package names drift between releases: Mesa's VA-API driver has been split
+# and merged again more than once, and a name that is gone aborts the whole
+# transaction under `pacman -S`. Optional packages go through this gate.
+append_package_if_available() {
+    local package="$1"
+    if package_exists "$package"; then
+        append_package "$package"
+        return 0
+    fi
+    return 1
+}
+
+# One entry per GPU vendor present in the machine, so a hybrid laptop gets
+# both stacks instead of only the one that matched first.
+append_vendor_gpu_packages() {
+    local vendor="$1"
+
+    case "$PACKAGE_MANAGER:$vendor" in
+        pacman:intel)
+            # Intel ships both integrated graphics and the Arc/Battlemage
+            # discrete cards; the same Mesa and media stack drives both.
+            append_package vulkan-intel
+            # Gen 9 and newer (Apollo Lake, Gemini Lake, Xe, Arc) use iHD;
+            # Gen 8 and older use i965. The two drivers install side by side
+            # and libva selects by PCI id, so no generation table is needed.
+            append_package_if_available intel-media-driver
+            append_package_if_available libva-intel-driver
+            append_package_if_available intel-gmmlib
+            ;;
+        pacman:amd)
+            append_package vulkan-radeon
+            append_package_if_available libva-mesa-driver
+            append_package_if_available mesa-vdpau
+            ;;
+        pacman:nvidia)
+            # Userspace only. The kernel module is a separate, confirmed step
+            # because it has to match the running kernel.
+            append_package_if_available nvidia-utils
+            append_package_if_available egl-wayland
+            # Bridges VA-API onto NVDEC so the same decode path works.
+            append_package_if_available libva-nvidia-driver
+            ;;
+        apt:intel)
+            append_package_if_available mesa-vulkan-drivers
+            append_package_if_available intel-media-va-driver-non-free ||
+                append_package_if_available intel-media-va-driver
+            append_package_if_available i965-va-driver
+            ;;
+        apt:amd)
+            append_package_if_available mesa-vulkan-drivers
+            append_package_if_available mesa-va-drivers
+            append_package_if_available mesa-vdpau-drivers
+            ;;
+        apt:nvidia)
+            append_package_if_available libnvidia-egl-wayland1
+            append_package_if_available libva-nvidia-driver
+            if ((!SKIP_DRIVERS)); then
+                append_package_if_available ubuntu-drivers-common
+            fi
+            ;;
+    esac
+}
+
+# Audio and video decoding. Without these a browser plays no H.264, and
+# without a VA-API driver every frame is decoded on the CPU, which an N4100
+# class machine cannot do at 1080p without dropping frames.
+append_codec_packages() {
+    case "$PACKAGE_MANAGER" in
+        pacman)
+            append_package_if_available gst-plugins-base
+            append_package_if_available gst-plugins-good
+            append_package_if_available gst-plugins-bad
+            append_package_if_available gst-plugins-ugly
+            append_package_if_available gst-libav
+            append_package_if_available ffmpeg
+            append_package_if_available libva-utils
+            append_package_if_available vdpauinfo
+            # The volume reading and every application's audio need a running
+            # sound server; nothing else in this install pulls one in.
+            append_package_if_available pipewire
+            append_package_if_available pipewire-pulse
+            append_package_if_available pipewire-audio
+            append_package_if_available wireplumber
+            ;;
+        apt)
+            append_package_if_available gstreamer1.0-plugins-base
+            append_package_if_available gstreamer1.0-plugins-good
+            append_package_if_available gstreamer1.0-plugins-bad
+            append_package_if_available gstreamer1.0-plugins-ugly
+            append_package_if_available gstreamer1.0-libav
+            append_package_if_available gstreamer1.0-vaapi
+            append_package_if_available ffmpeg
+            append_package_if_available vainfo
+            append_package_if_available vdpauinfo
+            append_package_if_available pipewire
+            append_package_if_available pipewire-pulse
+            append_package_if_available wireplumber
+            ;;
+    esac
+}
+
 append_gpu_packages() {
     append_package ca-certificates
     append_package curl
@@ -620,30 +832,13 @@ append_gpu_packages() {
     append_package tar
     append_package mesa-utils
     append_package vulkan-tools
+    append_package linux-firmware
 
-    case "$DISTRO_ID:$GPU_VENDOR" in
-        ubuntu:nvidia|linuxmint:nvidia)
-            # ubuntu-drivers chooses a matching package and is invoked later
-            # only after an explicit confirmation.
-            if (( ! SKIP_DRIVERS )); then
-                append_package ubuntu-drivers-common
-            fi
-            ;;
-        ubuntu:*|linuxmint:*)
-            append_package linux-firmware
-            ;;
-        arch:intel)
-            append_package vulkan-intel
-            append_package linux-firmware
-            ;;
-        arch:amd)
-            append_package vulkan-radeon
-            append_package linux-firmware
-            ;;
-        arch:*)
-            append_package linux-firmware
-            ;;
-    esac
+    local vendor
+    for vendor in $GPU_VENDORS; do
+        append_vendor_gpu_packages "$vendor"
+    done
+    append_codec_packages
 }
 
 package_is_installed() {
@@ -734,7 +929,10 @@ show_host_report() {
         printf 'Memória: indisponível\n'
     fi
     printf 'GPU: %s\n' "$GPU_MODEL"
+    printf 'Fabricantes de GPU: %s\n' "$GPU_VENDORS"
+    printf 'Fabricante da CPU: %s\n' "$CPU_VENDOR"
     printf 'Driver GPU: %s (%s)\n' "$GPU_DRIVER" "$GPU_DRIVER_STATUS"
+    printf 'Aceleração de vídeo: %s\n' "$VIDEO_ACCELERATION_STATUS"
     printf 'Sessão atual: %s\n' "$SESSION_STATUS"
     printf 'Vulkan: %s\n' "$VULKAN_STATUS"
     printf 'OpenGL: %s\n' "$OPENGL_STATUS"
@@ -836,10 +1034,46 @@ repair_gpu_driver() {
         return 0
     fi
 
+    # A hybrid machine carries more than one vendor; report each one so an
+    # unconfirmed integrated driver is not hidden behind a working discrete
+    # card, or the reverse.
+    local vendor
+    for vendor in $GPU_VENDORS; do
+        case "$vendor" in
+            intel)
+                info "Intel detectada (integrada ou Arc/Battlemage dedicada): Mesa, Vulkan e VA-API serão instalados"
+                ;;
+            amd)
+                info "AMD detectada: Mesa, Vulkan (RADV) e VA-API/VDPAU serão instalados"
+                ;;
+            nvidia)
+                info "NVIDIA detectada: espaço de usuário e a ponte VA-API serão instalados"
+                ;;
+        esac
+    done
+
     case "$GPU_VENDOR" in
         nvidia)
             if [[ "$GPU_DRIVER_STATUS" == installed ]]; then
                 success "driver NVIDIA detectado: $GPU_DRIVER"
+            elif [[ "$DISTRO_ID" == arch ]]; then
+                # The kernel module has to match the running kernel, and the
+                # wrong choice leaves the machine without any display driver.
+                # `nvidia-dkms` rebuilds against whatever kernel is installed,
+                # which is the only choice that is safe without knowing it.
+                if ((DRY_RUN)); then
+                    info "seria oferecido: pacman -S nvidia-dkms nvidia-utils (somente após confirmação)"
+                else
+                    warn "instalar o módulo NVIDIA exige cabeçalhos do kernel e uma reinicialização"
+                    if confirm_optional "Instalar o driver NVIDIA (nvidia-dkms) agora?"; then
+                        if run_privileged pacman -S --needed --noconfirm nvidia-dkms nvidia-utils; then
+                            GPU_DRIVER_STATUS="installed"
+                            success "driver NVIDIA instalado; reinicie antes de entrar no Caelune"
+                        else
+                            warn "não foi possível instalar o driver NVIDIA; o fallback gráfico continua disponível"
+                        fi
+                    fi
+                fi
             elif [[ "$DISTRO_ID" == ubuntu || "$DISTRO_ID" == linuxmint ]]; then
                 if ((DRY_RUN)); then
                     info "seria executado: ubuntu-drivers install (somente após confirmação)"
@@ -873,6 +1107,57 @@ repair_gpu_driver() {
             warn "não foi possível identificar a GPU; nenhuma alteração de driver será forçada"
             ;;
     esac
+}
+
+configure_video_acceleration() {
+    # Moving video decode off the CPU is the single largest difference a user
+    # feels on low-power hardware: a 1080p stream that pins every core at 100%
+    # in software costs a few percent on the GPU's fixed-function decoder.
+    #
+    # libva picks its driver from the PCI id on its own for Intel and AMD. Only
+    # NVIDIA needs to be told, because its VA-API support is a bridge onto
+    # NVDEC rather than a native driver.
+    local env_file="$TARGET_CONFIG_DIR/video.env"
+    local stage="$WORK_DIR/video.env"
+    local report=""
+
+    if has_command vainfo; then
+        report="$(run_as_target vainfo 2>/dev/null | sed -n 's/.*Driver version:[[:space:]]*//p' | head -n 1 || true)"
+    fi
+
+    if [[ -n "$report" ]]; then
+        VIDEO_ACCELERATION_STATUS="available"
+        success "aceleração de vídeo ativa: $report"
+    else
+        VIDEO_ACCELERATION_STATUS="unconfirmed"
+        warn "não foi possível confirmar VA-API agora; execute 'vainfo' após reiniciar a sessão"
+    fi
+
+    if [[ -e "$env_file" ]]; then
+        info "preservando configuração de vídeo existente: $env_file"
+        return 0
+    fi
+
+    {
+        printf '%s\n' '# Environment Caelune hands to every application it starts.'
+        printf '%s\n' '# One KEY=VALUE per line. Lines starting with # are ignored.'
+        case " $GPU_VENDORS " in
+            *" intel "*|*" amd "*)
+                # libva resolves these itself; naming a driver here would only
+                # break the machine when the card changes.
+                printf '%s\n' '# Intel and AMD: libva selects the driver by PCI id.'
+                ;;
+            *" nvidia "*)
+                printf '%s\n' 'LIBVA_DRIVER_NAME=nvidia'
+                printf '%s\n' 'NVD_BACKEND=direct'
+                printf '%s\n' 'GBM_BACKEND=nvidia-drm'
+                printf '%s\n' '__GLX_VENDOR_LIBRARY_NAME=nvidia'
+                ;;
+        esac
+    } > "$stage"
+    run_target mkdir -p -- "$TARGET_CONFIG_DIR"
+    install_target_file "$stage" "$env_file"
+    success "ambiente de vídeo gravado em $env_file"
 }
 
 configure_portals() {
@@ -951,7 +1236,10 @@ configure_seat_access() {
     if ((enable_seatd)); then
         info "seatd está instalado mas não está ativo; ele é o fallback quando o logind não atende"
     fi
-    confirm "Configurar o acesso a seat/DRM (grupos e seatd) para $TARGET_USER?"
+    if ! confirm_optional "Configurar o acesso a seat/DRM (grupos e seatd) para $TARGET_USER?"; then
+        warn "acesso a seat/DRM não foi configurado; a sessão nativa pode não conseguir abrir a GPU"
+        return 0
+    fi
 
     for group in "${missing_groups[@]}"; do
         if ! run_privileged usermod -aG "$group" "$TARGET_USER"; then
@@ -988,7 +1276,10 @@ configure_flatpak() {
     fi
 
     info "a galeria Caelune usa Flathub para descobrir aplicativos Flatpak"
-    confirm "Adicionar o repositório oficial Flathub para $TARGET_USER?"
+    if ! confirm_optional "Adicionar o repositório oficial Flathub para $TARGET_USER?"; then
+        warn "Flathub não foi adicionado; a galeria de aplicativos ficará vazia"
+        return 0
+    fi
     if run_target flatpak remote-add --if-not-exists --user flathub \
         https://flathub.org/repo/flathub.flatpakrepo; then
         success "Flathub configurado para $TARGET_USER"
@@ -1900,6 +2191,7 @@ main() {
     configure_user_defaults
     configure_seat_access
     configure_portals
+    configure_video_acceleration
     configure_flatpak
     success "Caelune instalado com sucesso"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
