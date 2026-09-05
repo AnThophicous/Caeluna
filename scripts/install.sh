@@ -875,6 +875,36 @@ repair_gpu_driver() {
     esac
 }
 
+configure_portals() {
+    # xdg-desktop-portal picks its backend by XDG_CURRENT_DESKTOP. Caelune is
+    # not a name any backend declares, so without this file no portal matches
+    # and every file dialog, screenshot and screen share fails inside the
+    # session, including for every Flatpak application.
+    local portal_dir="/usr/share/xdg-desktop-portal"
+    local portal_file="$portal_dir/caelune-portals.conf"
+    local stage="$WORK_DIR/caelune-portals.conf"
+
+    if [[ -e "$portal_file" ]]; then
+        info "configuração de portal já existe: $portal_file"
+        return 0
+    fi
+    if [[ ! -d "$portal_dir" ]]; then
+        warn "xdg-desktop-portal não está instalado; diálogos de arquivo ficarão indisponíveis"
+        return 0
+    fi
+
+    {
+        printf '%s\n' '[preferred]'
+        printf '%s\n' 'default=gtk'
+        printf '%s\n' 'org.freedesktop.impl.portal.Settings=gtk'
+    } > "$stage"
+    if run_file install -m 0644 -- "$stage" "$portal_file"; then
+        success "portais configurados para o desktop Caelune"
+    else
+        warn "não foi possível instalar $portal_file"
+    fi
+}
+
 configure_seat_access() {
     # libseat prefers logind and falls back to seatd. Installing the seatd
     # package is not enough: the socket has to be running and the account has
@@ -1869,6 +1899,7 @@ main() {
     activate_files
     configure_user_defaults
     configure_seat_access
+    configure_portals
     configure_flatpak
     success "Caelune instalado com sucesso"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then

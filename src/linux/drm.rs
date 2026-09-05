@@ -543,6 +543,15 @@ impl NativeDrmBackend {
             .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::Drm, error.to_string()))
     }
 
+    /// The dmabuf formats the native renderer can import, for the Wayland
+    /// `zwp_linux_dmabuf_v1` global.
+    #[cfg(feature = "native-session")]
+    pub fn render_formats(&self) -> Option<smithay::backend::allocator::format::FormatSet> {
+        self.pipeline
+            .as_ref()
+            .and_then(native::NativeFramePipeline::render_formats)
+    }
+
     /// Number of frames whose DRM page-flip has reached vblank.
     #[cfg(feature = "native-session")]
     pub fn presented_frames(&self) -> u64 {
@@ -989,6 +998,16 @@ pub(super) fn run_native(
         smithay::utils::Transform::Normal,
     )
     .map_err(|error| NativeDrmError::new(NativeDrmErrorKind::EventLoop, error.to_string()))?;
+
+    // Accelerated clients need the dmabuf global before they connect, so it is
+    // published as soon as both the renderer and the Wayland state exist.
+    if let Some(formats) = runtime.borrow().render_formats() {
+        state.enable_dmabuf(formats);
+    }
+    // Portals and other D-Bus activated services are started by the user bus
+    // and never inherit this process's environment. Only the native session
+    // publishes it; a nested one would overwrite the host desktop's.
+    state.export_session_environment();
 
     let (input_session, seat_name) = {
         let backend = runtime.borrow();

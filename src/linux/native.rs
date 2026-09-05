@@ -143,6 +143,11 @@ impl NativeFramePipeline {
         self.crtc
     }
 
+    /// The dmabuf formats this renderer can import, for the Wayland global.
+    pub(crate) fn render_formats(&self) -> Option<smithay::backend::allocator::format::FormatSet> {
+        <GlesRenderer as Bind<Dmabuf>>::supported_formats(&self.renderer)
+    }
+
     pub(crate) fn size(&self) -> Size<i32, Physical> {
         self.size
     }

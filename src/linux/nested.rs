@@ -164,11 +164,21 @@ pub(super) fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn install_winit_backend(
     event_loop: &mut EventLoop<Rouch>,
     state: &mut Rouch,
-    backend: WinitGraphicsBackend<GlesRenderer>,
+    mut backend: WinitGraphicsBackend<GlesRenderer>,
     winit: WinitEventLoop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let output = state.output.clone();
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+
+    // Accelerated clients need the dmabuf global before they connect.
+    {
+        use smithay::backend::{allocator::dmabuf::Dmabuf, renderer::Bind};
+        let formats = <GlesRenderer as Bind<Dmabuf>>::supported_formats(backend.renderer());
+        if let Some(formats) = formats {
+            state.enable_dmabuf(formats);
+        }
+    }
+
     let backend = Rc::new(RefCell::new(backend));
     backend.borrow().window().request_redraw();
 

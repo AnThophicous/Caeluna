@@ -75,12 +75,23 @@ impl DesktopEntry {
         !self.no_display && !self.name.is_empty() && !self.exec.is_empty()
     }
 
-    /// The launch command as (program, args), with %U/%f codes stripped.
+    /// The launch command as (program, args), with launch-time markers stripped.
     pub fn launch_parts(&self) -> (String, Vec<String>) {
-        let mut parts = shlex_split(&self.exec).filter(|token| !token.starts_with('%'));
+        let mut parts = shlex_split(&self.exec).filter(|token| !is_launch_marker(token));
         let program = parts.next().unwrap_or_default();
         (program, parts.collect())
     }
+}
+
+/// Tokens that only mean something when files are being opened.
+///
+/// `%U`, `%f` and friends are the freedesktop field codes. `@@` and `@@u` are
+/// Flatpak's file-forwarding markers: every entry Flatpak exports contains
+/// `--file-forwarding app @@u %U @@`, and passing the markers through makes
+/// `flatpak run` reject the command line. Rouch launches without a file
+/// argument, so all of them are dropped together.
+fn is_launch_marker(token: &str) -> bool {
+    token.starts_with('%') || token == "@@" || token == "@@u"
 }
 
 /// A minimal shell-style splitter, honouring double quotes.
@@ -111,6 +122,26 @@ mod tests {
     use super::*;
 
     const BODY: &str = "[Desktop Entry]\nType=Application\nName=Text Editor\nExec=gnome-text-editor %U\nIcon=org.gnome.TextEditor\nCategories=Utility;TextEditor;\nNoDisplay=false\n\n[Other]\nName=Ignored\n";
+
+    #[test]
+    fn flatpak_file_forwarding_markers_never_reach_the_command_line() {
+        let entry = DesktopEntry::parse(
+            "org.videolan.VLC",
+            "[Desktop Entry]\nName=VLC\nExec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --file-forwarding org.videolan.VLC @@u %U @@\n",
+        );
+        let (program, args) = entry.launch_parts();
+        assert_eq!(program, "/usr/bin/flatpak");
+        assert_eq!(
+            args,
+            vec![
+                "run".to_owned(),
+                "--branch=stable".to_owned(),
+                "--arch=x86_64".to_owned(),
+                "--file-forwarding".to_owned(),
+                "org.videolan.VLC".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_the_desktop_entry_group_only() {

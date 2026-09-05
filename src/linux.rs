@@ -8,9 +8,10 @@
 use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
-    delegate_alpha_modifier, delegate_compositor, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
+    backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
+    delegate_alpha_modifier, delegate_compositor, delegate_data_device, delegate_dmabuf,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{Space, Window as DesktopWindow},
     input::{Seat, SeatHandler, SeatState},
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -27,10 +28,20 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputHandler, OutputManagerState},
+        selection::{
+            SelectionHandler,
+            data_device::{
+                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                set_data_device_focus,
+            },
+            primary_selection::{PrimarySelectionHandler, PrimarySelectionState, set_primary_focus},
+        },
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler,
             XdgShellState,
+            decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
@@ -79,6 +90,13 @@ use decorations::Decorations;
 use dock_render::DockRenderer;
 use grabs::{DragTarget, PressedSerials};
 use welcome_render::WelcomeRenderer;
+
+/// The desktop name applications and portals see.
+///
+/// It must match the `DesktopNames` of the installed Wayland session entry and
+/// the portal configuration the installer writes, or `xdg-desktop-portal` finds
+/// no backend and every file dialog, screenshot and screen share fails.
+pub(crate) const CURRENT_DESKTOP: &str = "Caelune";
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let options = crate::session::parse_args(args)
@@ -241,19 +259,31 @@ fn whoami_cached() -> String {
     USER.get_or_init(crate::user::whoami).clone()
 }
 
-/// Verify a password against the account's /etc/shadow hash.
+/// Locations of `unix_chkpwd`, the setuid helper `pam_unix` itself uses.
+const UNIX_CHKPWD_PATHS: [&str; 4] = [
+    "/usr/lib/unix_chkpwd",
+    "/usr/sbin/unix_chkpwd",
+    "/sbin/unix_chkpwd",
+    "/usr/libexec/unix_chkpwd",
+];
+
+/// Verify a password for `user`, the way the system itself does.
 ///
-/// Supports the SHA-512 crypt format (`$6$salt$hash`), which is the default
-/// on modern distributions. The digest is SHA-512 in the custom crypt
-/// loop; rather than reimplementing it, Rouch defers to the system's
-/// `openssl passwd -6 -salt salt` for the comparison, matching PAM's
-/// result without linking libcrypt.
+/// The compositor runs as an unprivileged user, so it cannot read
+/// `/etc/shadow`: every direct comparison against it fails and the lock screen
+/// can never be unlocked. `unix_chkpwd` is the setuid helper `pam_unix`
+/// delegates to for exactly this reason; it reads the password from stdin and
+/// exits zero when it matches. The `/etc/shadow` path below stays as a
+/// fallback for a session that really does run privileged.
 fn verify_password(user: &str, typed: &str) -> bool {
     if typed.is_empty() {
         return false;
     }
+    if let Some(accepted) = verify_password_with_helper(user, typed) {
+        return accepted;
+    }
     let Some(shadow_line) = shadow_hash_for(user) else {
-        // No shadow access (non-root display managers): refuse politely.
+        warn!("No password backend is reachable; the lock screen cannot verify this account");
         return false;
     };
     let Some((_, salt, _)) = split_crypt_fields(&shadow_line) else {
@@ -270,6 +300,44 @@ fn verify_password(user: &str, typed: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Ask `unix_chkpwd` to check the password.
+///
+/// `None` means no helper was usable, so the caller should try its fallback;
+/// `Some(false)` is a real rejection.
+fn verify_password_with_helper(user: &str, typed: &str) -> Option<bool> {
+    use std::io::Write as _;
+
+    let helper = UNIX_CHKPWD_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())?;
+
+    let mut child = std::process::Command::new(helper)
+        .arg(user)
+        .arg("nullok")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| warn!(helper, ?error, "Could not run the password helper"))
+        .ok()?;
+
+    // The helper expects the password on stdin, NUL-terminated and without a
+    // trailing newline.
+    let mut secret = typed.as_bytes().to_vec();
+    secret.push(0);
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(&secret);
+    }
+    // Dropping stdin closes the pipe, which the helper waits for.
+    drop(child.stdin.take());
+
+    let status = child
+        .wait()
+        .map_err(|error| warn!(helper, ?error, "Password helper did not exit cleanly"))
+        .ok()?;
+    Some(status.success())
 }
 
 /// The account's hash field from /etc/shadow.
@@ -309,11 +377,50 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Scan the freedesktop application directories once.
-fn scan_applications() -> Vec<crate::desktop_entry::DesktopEntry> {
-    let mut dirs = vec![std::path::PathBuf::from("/usr/share/applications")];
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(std::path::PathBuf::from(home).join(".local/share/applications"));
+/// Every directory that can hold a `.desktop` entry, in XDG precedence order.
+///
+/// Flatpak exports its entries under `exports/share/applications` rather than
+/// the plain data directory. The application gallery installs with
+/// `flatpak run --user`, so without the user export path nothing it installs
+/// ever reaches the launcher or the dock.
+fn application_directories() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"));
+        dirs.push(data_home.join("applications"));
+        dirs.push(data_home.join("flatpak/exports/share/applications"));
     }
+
+    let data_dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+    let bases: Vec<PathBuf> = if data_dirs.trim().is_empty() {
+        vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]
+    } else {
+        data_dirs
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    };
+    for base in bases {
+        dirs.push(base.join("applications"));
+    }
+    dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
+    dirs.push(PathBuf::from("/var/lib/snapd/desktop/applications"));
+
+    dirs.dedup();
+    dirs
+}
+
+fn scan_applications() -> Vec<crate::desktop_entry::DesktopEntry> {
+    let dirs = application_directories();
+    // The first directory that defines an id wins, matching XDG precedence:
+    // a user override must shadow the system entry, not duplicate it.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut apps = Vec::new();
     for dir in dirs {
@@ -333,6 +440,9 @@ fn scan_applications() -> Vec<crate::desktop_entry::DesktopEntry> {
             };
             let id = path.file_stem().map(|stem| stem.to_string_lossy().into_owned());
             let Some(id) = id else { continue };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             let entry = crate::desktop_entry::DesktopEntry::parse(&id, &body);
             if entry.visible() {
                 apps.push(entry);
@@ -369,6 +479,19 @@ pub struct Rouch {
     shm_state: ShmState,
     _output_manager_state: OutputManagerState,
     _alpha_modifier_state: smithay::wayland::alpha_modifier::AlphaModifierState,
+    /// Clipboard and drag-and-drop. Without this global no application can
+    /// copy or paste, which rules the desktop out for daily use.
+    data_device_state: DataDeviceState,
+    /// Middle-click paste, which X11 users expect from every toolkit.
+    primary_selection_state: PrimarySelectionState,
+    /// Server-side decoration negotiation. Rouch draws its own chrome, so a
+    /// client that also draws CSD would stack two title bars.
+    _xdg_decoration_state: XdgDecorationState,
+    /// GPU buffer sharing. Mesa's EGL Wayland platform refuses to initialize
+    /// without it, so every accelerated client falls back to software or fails
+    /// outright until the global exists.
+    dmabuf_state: DmabufState,
+    dmabuf_global: Option<DmabufGlobal>,
     seat_state: SeatState<Rouch>,
     seat: Seat<Rouch>,
 
@@ -456,6 +579,9 @@ pub struct Rouch {
     launcher_query: String,
     /// The parsed application database, scanned once at startup.
     applications: Vec<crate::desktop_entry::DesktopEntry>,
+    /// When the entry database was last scanned, so the launcher can pick up a
+    /// newly installed application without pacing a full rescan every frame.
+    applications_scanned_at: Option<Instant>,
 
     /// The desktop icon area, mapped from the user's Desktop directory.
     desktop: crate::desktop_icons::Desktop,
@@ -497,6 +623,9 @@ struct XdgWindow {
     id: WindowId,
     surface: ToplevelSurface,
     desktop: DesktopWindow,
+    /// Whether the client's own size has been adopted once, after its first
+    /// configured commit. The compositor's pre-map geometry is a placeholder.
+    adopted_size: bool,
 }
 
 /// Visual preferences captured once around a Game Mode policy transition.
@@ -516,6 +645,9 @@ impl Rouch {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let alpha_modifier_state =
             smithay::wayland::alpha_modifier::AlphaModifierState::new::<Self>(&display_handle);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "rouch");
         seat.add_keyboard(Default::default(), 200, 25)?;
@@ -553,6 +685,13 @@ impl Rouch {
             shm_state,
             _output_manager_state: output_manager_state,
             _alpha_modifier_state: alpha_modifier_state,
+            data_device_state,
+            primary_selection_state,
+            _xdg_decoration_state: xdg_decoration_state,
+            // The dmabuf global needs the renderer's format list, which only
+            // exists once a backend has built one. `enable_dmabuf` publishes it.
+            dmabuf_state: DmabufState::new(),
+            dmabuf_global: None,
             seat_state,
             seat,
             windows: WindowManager::new(work_area_for(output_size)),
@@ -627,6 +766,7 @@ impl Rouch {
             launcher_open: false,
             launcher_query: String::new(),
             applications: scan_applications(),
+            applications_scanned_at: Some(Instant::now()),
 
             desktop: scan_desktop(),
 
@@ -888,13 +1028,10 @@ impl Rouch {
         if app_store_backend::validate_app_id(app_id).is_err() {
             return;
         }
-        let result = std::process::Command::new("flatpak")
-            .args(["run", "--user", app_id])
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let mut command = std::process::Command::new("flatpak");
+        command.args(["run", "--user", app_id]);
+        self.prepare_client_command(&mut command);
+        let result = command.spawn();
         if let Err(error) = result {
             warn!(app_id, ?error, "Could not open Flatpak application");
             let _ = self.notify(crate::notifications::Notification::new(
@@ -1151,6 +1288,9 @@ impl Rouch {
     pub fn toggle_launcher(&mut self) {
         self.launcher_open = !self.launcher_open;
         if self.launcher_open {
+            // An application installed during this session must show up here
+            // without a relogin.
+            self.refresh_applications();
             self.launcher_query.clear();
             self.app_store_open = false;
             self.notifications_open = false;
@@ -1197,15 +1337,46 @@ impl Rouch {
         }
         info!(app_id, program, "Launching application");
         let mut command = std::process::Command::new(&program);
-        command
-            .args(&args)
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        command.args(&args);
+        self.prepare_client_command(&mut command);
         if let Err(error) = command.spawn() {
             warn!(program, ?error, "Could not launch application");
         }
+    }
+
+    /// Configure one child process to run as a native Wayland client.
+    ///
+    /// A toolkit only selects its Wayland backend when it is told to. Qt in
+    /// particular defaults to X11 and simply exits when no X server answers,
+    /// so a desktop that sets `WAYLAND_DISPLAY` alone cannot start half the
+    /// applications a user has installed.
+    fn prepare_client_command(&self, command: &mut std::process::Command) {
+        command
+            .env("WAYLAND_DISPLAY", &self.socket_name)
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("XDG_CURRENT_DESKTOP", CURRENT_DESKTOP)
+            .env("XDG_SESSION_DESKTOP", CURRENT_DESKTOP)
+            // `wayland;xcb` keeps the X11 path available for the day XWayland
+            // is bridged, without making it the first choice today.
+            .env("QT_QPA_PLATFORM", "wayland;xcb")
+            .env("GDK_BACKEND", "wayland,x11")
+            .env("SDL_VIDEODRIVER", "wayland")
+            .env("CLUTTER_BACKEND", "wayland")
+            .env("MOZ_ENABLE_WAYLAND", "1")
+            .env("ELECTRON_OZONE_PLATFORM_HINT", "auto")
+            // Rouch draws every title bar itself; a Qt client that also draws
+            // one would stack two.
+            .env("QT_WAYLAND_DISABLE_WINDOWDECORATION", "1")
+            // Reparenting window managers confuse AWT into a blank frame.
+            .env("_JAVA_AWT_WM_NONREPARENTING", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        // A `DISPLAY` inherited from the display manager points at an X server
+        // that is not ours. Until XWayland is bridged, leaving it set makes a
+        // toolkit prefer a server it cannot reach.
+        command.env_remove("DISPLAY");
     }
 
     // ----- Finder --------------------------------------------------------
@@ -2133,6 +2304,72 @@ impl Rouch {
         Ok(socket_name)
     }
 
+    /// Hand the session environment to systemd and D-Bus.
+    ///
+    /// Portals, notification daemons and every other D-Bus activated service
+    /// are started by the user bus, not by this process, so they never inherit
+    /// the compositor's environment. Without this step `xdg-desktop-portal`
+    /// comes up with no `WAYLAND_DISPLAY` and no `XDG_CURRENT_DESKTOP`, which
+    /// breaks file dialogs, screenshots, screen sharing and "open link" for
+    /// every sandboxed application.
+    ///
+    /// Only the native session may do this: a nested session would overwrite
+    /// the host desktop's own variables.
+    pub(crate) fn export_session_environment(&self) {
+        const VARIABLES: [&str; 4] = [
+            "WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_DESKTOP",
+        ];
+
+        // SAFETY: single-threaded startup, before any client can connect.
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", &self.socket_name);
+            std::env::set_var("XDG_CURRENT_DESKTOP", CURRENT_DESKTOP);
+            std::env::set_var("XDG_SESSION_DESKTOP", CURRENT_DESKTOP);
+            std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        }
+
+        for (program, leading) in [
+            ("systemctl", vec!["--user", "import-environment"]),
+            ("dbus-update-activation-environment", vec!["--systemd"]),
+        ] {
+            let mut command = std::process::Command::new(program);
+            command
+                .args(&leading)
+                .args(VARIABLES)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match command.status() {
+                Ok(status) if status.success() => {
+                    info!(program, "Exported the session environment");
+                }
+                Ok(status) => warn!(program, ?status, "Session environment export was rejected"),
+                Err(error) => warn!(program, ?error, "Session environment export is unavailable"),
+            }
+        }
+    }
+
+    /// Publish the `zwp_linux_dmabuf_v1` global for the renderer's formats.
+    ///
+    /// Backends call this once their renderer exists. Until the global is up,
+    /// Mesa's Wayland EGL platform refuses to initialize, so every accelerated
+    /// client either renders through software or fails to start.
+    pub(crate) fn enable_dmabuf(&mut self, formats: smithay::backend::allocator::format::FormatSet) {
+        if self.dmabuf_global.is_some() {
+            return;
+        }
+        let count = formats.iter().count();
+        if count == 0 {
+            warn!("Renderer reported no dmabuf formats; accelerated clients will use wl_shm");
+            return;
+        }
+        self.dmabuf_global = Some(self.dmabuf_state.create_global::<Self>(&self.display_handle, formats));
+        info!(formats = count, "Published the dmabuf global for accelerated clients");
+    }
+
     fn window_id(&self, surface: &ToplevelSurface) -> Option<WindowId> {
         self.xdg_windows
             .iter()
@@ -2469,12 +2706,31 @@ impl Rouch {
     }
 
     /// Launch an application by desktop id through the session launcher.
-    fn spawn_app(&self, app_id: &str) {
-        use std::process::{Command, Stdio};
+    /// Open a dock item.
+    ///
+    /// Dock ids are desktop-entry ids, so the scanned application database is
+    /// the authority. The alias table below only covers the handful of default
+    /// dock entries whose id does not match any installed entry, so a fresh
+    /// install still opens something instead of logging and doing nothing.
+    fn spawn_app(&mut self, app_id: &str) {
+        if self.applications.iter().any(|app| app.id == app_id) {
+            self.launch(app_id);
+            return;
+        }
 
-        // Map dock ids onto executable guesses; a real desktop-entry
-        // database replaces this in the launcher milestone.
-        let program = match app_id {
+        // A Flatpak of the same application is exported under the same
+        // reverse-DNS id, so a case-insensitive match still finds it.
+        let matched = self
+            .applications
+            .iter()
+            .find(|app| app.id.eq_ignore_ascii_case(app_id))
+            .map(|app| app.id.clone());
+        if let Some(id) = matched {
+            self.launch(&id);
+            return;
+        }
+
+        let fallback = match app_id {
             "weston-terminal" => Some("weston-terminal"),
             "org.gnome.Files" => Some("nautilus"),
             "org.mozilla.firefox" => Some("firefox"),
@@ -2483,20 +2739,34 @@ impl Rouch {
             "org.gnome.Settings" => Some("gnome-control-center"),
             _ => None,
         };
-        let Some(program) = program else {
-            warn!(app_id, "No known launcher for this application");
+        let Some(program) = fallback else {
+            warn!(app_id, "No installed desktop entry matches this dock item");
             return;
         };
 
-        let mut command = Command::new(program);
-        command
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let mut command = std::process::Command::new(program);
+        self.prepare_client_command(&mut command);
         if let Err(error) = command.spawn() {
             warn!(program, ?error, "Could not launch application");
         }
+    }
+
+    /// Rescan the desktop-entry database.
+    ///
+    /// Installing an application must not require a new session, so the
+    /// launcher refreshes on open. The scan is paced because it touches every
+    /// entry in every XDG data directory.
+    pub fn refresh_applications(&mut self) {
+        const RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        if self
+            .applications_scanned_at
+            .is_some_and(|at| at.elapsed() < RESCAN_INTERVAL)
+        {
+            return;
+        }
+        self.applications = scan_applications();
+        self.applications_scanned_at = Some(Instant::now());
     }
 
     /// The launch-bounce offset for one dock item this frame.
@@ -2609,11 +2879,15 @@ fn surface_client_pid(handle: &DisplayHandle, surface: &ToplevelSurface) -> Opti
 }
 
 fn configure_toplevel(surface: &ToplevelSurface, window: &Window, bounds: WindowSize) {
+    // XDG requires the initial configure to leave the size unset so the client
+    // maps at its own natural geometry. Forcing one opens every dialog and
+    // utility window at the compositor's placeholder size.
+    let initial = !surface.is_initial_configure_sent();
+
     surface.with_pending_state(|state| {
-        state.size = Some(Size::<i32, Logical>::from((
-            window.frame().size.width,
-            window.frame().size.height,
-        )));
+        state.size = (!initial).then(|| {
+            Size::<i32, Logical>::from((window.frame().size.width, window.frame().size.height))
+        });
         state.bounds = Some(Size::<i32, Logical>::from((bounds.width, bounds.height)));
 
         set_xdg_state(
@@ -2672,15 +2946,43 @@ impl CompositorHandler for Rouch {
             "Wayland surface committed"
         );
 
-        if let Some(window) = self
+        let Some(index) = self
             .xdg_windows
             .iter()
-            .find(|window| window.surface.wl_surface() == surface)
-        {
-            // This checks the XDG initial-configure contract before a future
-            // renderer ever reads a client buffer.
-            let _configured = window.surface.ensure_configured();
+            .position(|window| window.surface.wl_surface() == surface)
+        else {
+            return;
+        };
+        // This checks the XDG initial-configure contract before a renderer
+        // ever reads a client buffer.
+        if !self.xdg_windows[index].surface.ensure_configured() {
+            return;
         }
+        if self.xdg_windows[index].adopted_size {
+            return;
+        }
+
+        // The client has now mapped at the size it chose. Adopt it once so the
+        // compositor's pre-map placeholder does not become every window's size.
+        let client_size = self.xdg_windows[index].desktop.geometry().size;
+        if client_size.w <= 0 || client_size.h <= 0 {
+            return;
+        }
+        self.xdg_windows[index].adopted_size = true;
+
+        let id = self.xdg_windows[index].id;
+        let Some(current) = self.windows.window(id).map(|window| window.frame().size) else {
+            return;
+        };
+        let delta = RouchPoint::new(
+            client_size.w - current.width,
+            client_size.h - current.height,
+        );
+        if delta.x == 0 && delta.y == 0 {
+            return;
+        }
+        self.windows.resize_by(id, ResizeEdge::BottomRight, delta);
+        self.reconfigure_windows();
     }
 }
 
@@ -2702,7 +3004,12 @@ impl XdgShellHandler for Rouch {
             .windows
             .create_window(WindowSize::new(960, 640), SizeLimits::default());
         let desktop = DesktopWindow::new_wayland_window(surface.clone());
-        self.xdg_windows.push(XdgWindow { id, surface, desktop });
+        self.xdg_windows.push(XdgWindow {
+            id,
+            surface,
+            desktop,
+            adopted_size: false,
+        });
         self.start_animation(id, crate::anim::Transition::Open);
         self.request_redraw();
         info!(window_id = id.raw(), "XDG toplevel created");
@@ -2955,6 +3262,85 @@ impl SeatHandler for Rouch {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
+
+    /// Clipboard ownership follows keyboard focus, as the data-device protocol
+    /// requires: only the focused client may read the current selection.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let client = focused.and_then(|surface| surface.client());
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        set_primary_focus(&self.display_handle, seat, client);
+    }
+}
+
+impl SelectionHandler for Rouch {
+    type SelectionUserData = ();
+}
+
+// Rouch never starts a compositor-initiated drag, and the client-initiated
+// path is fully handled by Smithay's grab. The default methods are correct;
+// the impls exist because `DataDeviceHandler` requires them.
+impl ClientDndGrabHandler for Rouch {}
+impl ServerDndGrabHandler for Rouch {}
+
+impl DataDeviceHandler for Rouch {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+impl PrimarySelectionHandler for Rouch {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl XdgDecorationHandler for Rouch {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // Rouch owns the title bar, traffic lights and resize borders, so a
+        // client must not draw its own. Answering ServerSide before the first
+        // configure keeps GTK from ever mapping a client-side header bar.
+        set_server_side_decoration(&toplevel);
+    }
+
+    fn request_mode(
+        &mut self,
+        toplevel: ToplevelSurface,
+        _mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+    ) {
+        set_server_side_decoration(&toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        set_server_side_decoration(&toplevel);
+    }
+}
+
+/// Pin one toplevel to server-side decorations and configure it.
+fn set_server_side_decoration(toplevel: &ToplevelSurface) {
+    use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+
+    toplevel.with_pending_state(|state| {
+        state.decoration_mode = Some(Mode::ServerSide);
+    });
+    if toplevel.is_initial_configure_sent() {
+        let _serial = toplevel.send_configure();
+    }
+}
+
+impl DmabufHandler for Rouch {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+        // The advertised format list comes straight from the active renderer,
+        // so a buffer that matches it is importable. The real import happens
+        // when the surface tree is turned into render elements; a buffer that
+        // fails there degrades to a missing frame rather than a dead client.
+        if let Err(error) = notifier.successful::<Self>() {
+            warn!(?error, ?dmabuf, "Could not acknowledge a client dmabuf import");
+        }
+    }
 }
 
 impl OutputHandler for Rouch {}
@@ -2982,3 +3368,7 @@ delegate_xdg_shell!(Rouch);
 delegate_shm!(Rouch);
 delegate_seat!(Rouch);
 delegate_alpha_modifier!(Rouch);
+delegate_data_device!(Rouch);
+delegate_primary_selection!(Rouch);
+delegate_xdg_decoration!(Rouch);
+delegate_dmabuf!(Rouch);
